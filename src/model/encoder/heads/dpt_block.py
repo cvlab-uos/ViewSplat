@@ -341,6 +341,18 @@ class DPTOutputAdapter(nn.Module):
                 nn.Dropout(0.1, False),
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
             )
+        # Add 'view_mlp' head type for view-dependent MLP parameter generation 
+        elif self.head_type == 'view_mlp':
+            self.head = nn.Sequential(
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(feature_dim) if use_bn else nn.Identity(),
+                nn.ReLU(True),
+                # Add an extra convolution layer to increase depth and enhance parameter expressivity
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+                nn.ReLU(True),
+                # Final convolution to output total_params (num_channels)
+                nn.Conv2d(feature_dim, self.num_channels, kernel_size=1, stride=1, padding=0)
+            )
         else:
             raise ValueError('DPT head_type must be "regression" or "semseg".')
 

@@ -8,9 +8,9 @@ from .dpt_gs_head import create_gs_dpt_head
 from .linear_head import LinearPts3d
 from .dpt_head import create_dpt_head
 from .pose_head import create_pose_head
+from .dpt_view_head import create_view_dpt_head
 
-
-def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_init_t=False, use_homogeneous=True, concat_enc=True):
+def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_init_t=False, use_homogeneous=True, concat_enc=True, mlp_dims=None): # Add mlp_dims
     """" build a prediction head for the decoder
     """
     if head_type == 'linear' and output_mode == 'pts3d':
@@ -21,6 +21,12 @@ def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_
         return create_dpt_head(net, has_conf=False, out_nchan=out_nchan, postprocess_func=None)
     elif head_type == 'dpt_gs' and output_mode == 'gs_params':
         return create_gs_dpt_head(net, has_conf=False, out_nchan=out_nchan, postprocess_func=None)
+
+    # Add view_mlp mode
+    elif head_type == 'dpt' and output_mode == 'view_mlp':
+        assert mlp_dims is not None, "view_mlp mode requires mlp_dims [in, hidden, out]"
+        return create_view_dpt_head(net, mlp_dims=mlp_dims, postprocess_func=None)
+
     else:
         raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")
     

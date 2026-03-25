@@ -1,5 +1,5 @@
 defaults:
-  - model/encoder: spfsplat
+  - model/encoder: spf_viewsplat
   - loss: []
   - override dataset/view_sampler@dataset.re10k.view_sampler: evaluation
 

@@ -34,15 +34,12 @@ lightning-utilities==0.11.9
 lpips==0.1.4
 MarkupSafe==2.1.1
 matplotlib==3.10.0
-mkl-service==2.4.0
-mkl_fft
-mkl_random
 moviepy==1.0.3
 mpmath==1.3.0
 multidict==6.1.0
 mypy_extensions==1.0.0
 networkx==3.1
-numpy==2.2.0
+numpy==1.26.4
 omegaconf==2.3.0
 opencv-python-headless==4.10.0.84
 opt-einsum-fx==0.1.4
@@ -84,6 +81,3 @@ urllib3==2.0.3
 wadler_lindig==0.1.7
 wandb==0.19.2
 yarl==1.18.3
-
-diff_gauss_pose @ git+https://github.com/slothfulxtx/diff-gaussian-rasterization.git@pose#egg=diff-gauss-pose
-pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@055ab3a2e3e611dff66fa82f632e62a315f3b5e7

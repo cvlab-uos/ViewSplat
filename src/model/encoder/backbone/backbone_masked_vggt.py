@@ -20,7 +20,7 @@ class BackboneMaskedVGGTCfg:
     name: Literal["masked_vggt"]
     intrinsics_embed_loc: Literal["encoder", "decoder", "none"] = 'none'
     # intrinsics_embed_type: Literal["pixelwise", "linear", "token"] = 'token'  # linear
-    pretrained: bool = True
+    pretrained: bool = False
 
 
 def init_weights(m):
@@ -38,6 +38,7 @@ class BackboneMaskedVGGT(Backbone[BackboneMaskedVGGTCfg]):
             self.model = VGGT.from_pretrained("facebook/VGGT-1B", intrinsics_embed_loc=self.cfg.intrinsics_embed_loc)
         else:
             self.model = VGGT(intrinsics_embed_loc=self.cfg.intrinsics_embed_loc)
+            self.model.apply(init_weights)
                 
     def forward(
         self,
@@ -62,4 +63,3 @@ class BackboneMaskedVGGT(Backbone[BackboneMaskedVGGTCfg]):
     @property
     def d_out(self) -> int:
         return 1024
-

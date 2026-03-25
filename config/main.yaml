@@ -1,10 +1,10 @@
 defaults:
-  - model/encoder: spfsplat
+  - model/encoder: spf_viewsplat
   - model/decoder: splatting_cuda
   - loss: [mse]
 
 wandb:
-  project: spfsplat
+  project: viewsplat
   entity: placeholder
   name: placeholder
   mode: disabled
@@ -27,7 +27,7 @@ data_loader:
     batch_size: 1
     seed: 2345
   val:
-    num_workers: 1
+    num_workers: 4
     persistent_workers: true
     batch_size: 1
     seed: 3456
@@ -54,12 +54,10 @@ train:
   distill_max_steps: 10000
 
   training_context: false
-  freeze_pretrained: false
+  freeze_spfsplat_pretrained: true    # To train or fine-tune the entire model end-to-end, set this to false.
+  freeze_geotransformer_pretrained: false
   freeze_backbone: false
   freeze_pose_head: false
-
-  random_drop_context_views: false
-  random_drop_target_views: false
 
 
 
@@ -72,6 +70,7 @@ test:
   save_image: true
   save_video: false
   save_compare: false
+  with_offset_only: false
 
 seed: 111123
 

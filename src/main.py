@@ -1,4 +1,5 @@
 import os
+os.environ["WANDB_INSECURE_DISABLE_SSL"] = "true"
 from pathlib import Path
 
 import hydra
@@ -138,6 +139,7 @@ def train(cfg_dict: DictConfig):
         accelerator="gpu",
         logger=logger,
         devices="auto",
+        accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
         strategy=(
             "ddp_find_unused_parameters_true"
             if torch.cuda.device_count() > 1

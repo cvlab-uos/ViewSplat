@@ -30,6 +30,7 @@ class ModelCfg:
 @dataclass
 class TrainerCfg:
     max_steps: int
+    accumulate_grad_batches: int
     val_check_interval: int | float | None
     gradient_clip_val: int | float | None
     num_nodes: int = 1

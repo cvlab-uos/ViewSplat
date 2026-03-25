@@ -51,6 +51,7 @@ from src.visualization.color_map import apply_color_map_to_image
 from ..misc.intrinsics_utils import estimate_intrinsics
 from src.evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import  pose_auc
+from .types import Gaussians
 
 @dataclass
 class OptimizerCfg:
@@ -70,6 +71,7 @@ class TestCfg:
     save_image: bool
     save_video: bool
     save_compare: bool
+    with_offset_only: bool
 
 
 @dataclass
@@ -80,7 +82,8 @@ class TrainCfg:
     distiller: str
     distill_max_steps: int
     training_context: bool
-    freeze_pretrained: bool 
+    freeze_spfsplat_pretrained: bool
+    freeze_geotransformer_pretrained: bool 
     freeze_backbone: bool
     freeze_pose_head: bool 
 
@@ -178,13 +181,75 @@ class ModelWrapper(LightningModule):
         if train_cfg.freeze_backbone: 
             self.freeze_params(freeze_keywords=['backbone'])
 
-        if train_cfg.freeze_pretrained: 
-            self.freeze_params(unfreeze_keywords=["gaussian_param_head", "pose_head", "intrinsic_encoder"])
+        if train_cfg.freeze_geotransformer_pretrained: 
+            self.freeze_params(unfreeze_keywords=["gaussian_param_head", "pose_head", "view_dependent_head", "intrinsic_encoder"])
+
+        if train_cfg.freeze_spfsplat_pretrained: 
+            self.freeze_params(unfreeze_keywords=['view_dependent_head'])
 
         if self.train_cfg.freeze_pose_head:
             self.freeze_params(freeze_keywords=['pose_head'])
 
         self.ckpt_path = None
+
+    def get_refined_gaussians(self, encoder_output, target_pose, h, w):
+        """
+        encoder_output: Dictionary containing vd_mlp_params, raw_data, etc.
+        target_pose: Camera extrinsic(pose) for the current rendering(target) view [B, 1, 4, 4]
+        """
+        if "vd_mlp_params" not in encoder_output:
+            return encoder_output["gaussians"], None
+
+        vd_params = encoder_output["vd_mlp_params"] # [B, V_cxt, N, C]
+        V_cxt = vd_params.shape[1]
+        S = self.encoder.cfg.num_surfaces
+        
+        vd_params_5d = rearrange(vd_params, "b v (h w) c -> b v c h w", h=h, w=w) # [B, V_cxt, C, H, W]
+        pts3d_flat = rearrange(encoder_output["raw_data"]["pts3d"], "b v n s d -> b (v n s) d") # [B, N_total, 3]
+        
+        # Compute relative pose input with regard to current extrinsic
+        vd_input = self.encoder.get_relative_pose_input(target_pose, pts3d_flat.unsqueeze(1)) # [B, 1, V_cxt*N*S, 4]
+        # vd_input rearrange
+        vd_input_aligned = rearrange(vd_input.squeeze(1), "b (v n s) d -> b v n s d", v=V_cxt, s=S)
+        vd_input_final = vd_input_aligned[:, :, :, 0, :] # Use first surface: [B, V_cxt, N, 4]
+
+        # Compute gaussian parameter offsets (Dimension: 86)
+        offset = self.encoder.compute_view_dependent_offset(vd_params_5d, vd_input_final, encoder_output["vd_mlp_dims"]) # [B, V-cxt, N, ou_d=86]
+
+        # Slice offsets (3 for mean, 1 for opacity, 82 for params)
+        # Apply unsqueeze(-2) to align with the Surface (S) dimension, resulting in a [B, V, N, 1, D] shape.
+        means_offset   = offset[..., :3].unsqueeze(-2)    # [B, V, N, 1, 3]
+        opacity_offset = offset[..., 3:4].unsqueeze(-2)  # [B, V, N, 1, 1]
+        params_offset  = offset[..., 4:].unsqueeze(-2)   # [B, V, N, 1, 82]
+
+        # Apply offsets to raw data
+        # pts3d: [B, V, N, S, 3], opacities: [B, V, N, S, 1], params: [B, V, N, S, 82]
+        refined_pts3d = encoder_output["raw_data"]["pts3d"] + means_offset
+        refined_opacities = encoder_output["raw_data"]["opacities"] + opacity_offset.squeeze(-1)
+        refined_opacities_sig = refined_opacities.sigmoid().unsqueeze(-1)
+        refined_params = encoder_output["raw_data"]["params"] + params_offset
+        
+        # Helper function to generate final Gaussians object via the Gaussian Adapter
+        def create_gaussians_obj(final_params):
+            gaussians = self.encoder.gaussian_adapter.forward(
+                refined_pts3d.unsqueeze(-2), # [B, V, N, S, 1, 3]
+                self.encoder.map_pdf_to_opacity(refined_opacities_sig, self.global_step),
+                rearrange(final_params, "b v n s c -> b v n s () c")
+            )
+            return Gaussians(
+                means=rearrange(gaussians.means, "b v n s spp xyz -> b (v n s spp) xyz"),
+                covariances=rearrange(gaussians.covariances, "b v n s spp i j -> b (v n s spp) i j"),
+                rotations=rearrange(gaussians.rotations, "b v n s spp i -> b (v n s spp) i"),
+                scales=rearrange(gaussians.scales, "b v n s spp i -> b (v n s spp) i"),
+                harmonics=rearrange(gaussians.harmonics, "b v n s spp c d_sh -> b (v n s spp) c d_sh"),
+                opacities=rearrange(gaussians.opacities, "b v n s spp -> b (v n s spp)")
+            )
+
+        # Generate refined_gaussians and offset_only_gaussians
+        refined_gaussians = create_gaussians_obj(refined_params)
+        offset_only_gaussians = create_gaussians_obj(params_offset)
+
+        return refined_gaussians, offset_only_gaussians
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -241,7 +306,7 @@ class ModelWrapper(LightningModule):
         
         total_loss = 0
 
-        gaussians = encoder_output["gaussians"]
+
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat([context_extrinsics, target_extrinsics], dim=1)
         intrinsics = target_intrinsics if not self.train_cfg.training_context else torch.cat([context_intrinsics, target_intrinsics], dim=1)
@@ -249,16 +314,29 @@ class ModelWrapper(LightningModule):
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
         target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
 
-        # Run decoder
-        output = self.decoder.forward(
-            gaussians,
-            extrinsics,
-            intrinsics,
-            near,
-            far,
-            (h, w),
-            depth_mode=self.train_cfg.depth_mode,
-        )
+        # View-dependent refinement loop
+        all_colors, all_depths = [], []
+
+        # Real-time gaussian refinement and rendering per view (v)
+        for i in range(extrinsics.shape[1]):
+            curr_target_ext = extrinsics[:, i:i+1] # Pose of current view [B, 1, 4, 4]
+            gaussians, _ = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+
+            # Run decoder (current view rendering)
+            out = self.decoder.forward(
+                gaussians, curr_target_ext, intrinsics[:, i:i+1],
+                near[:, i:i+1], far[:, i:i+1], (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+            all_colors.append(out.color)
+            all_depths.append(out.depth)
+
+        # Concat results [B, V, C, H, W]
+        output_color = torch.cat(all_colors, dim=1)
+        output_depth = torch.cat(all_depths, dim=1)
+        class Output: pass # Duck typing for compatibility with existing output objects
+        output = Output()
+        output.color, output.depth = output_color, output_depth
 
         # Compute PSNR
         psnr = compute_psnr(
@@ -281,7 +359,7 @@ class ModelWrapper(LightningModule):
                     if 'means' in visualization_dump:
                         pts3d = visualization_dump['means'].squeeze(-2) #  (b, v, h, w, 3)
 
-                        if self.encoder.cfg.name == 'spfsplat':
+                        if self.encoder.cfg.name == 'spf_viewsplat':
                             c1_loss = loss_fn.forward(pts3d[:,0], pred_extrinsics_cwt[:,0], context_intrinsics[:,0], self.global_step)
 
                             c2_loss = 0
@@ -384,6 +462,7 @@ class ModelWrapper(LightningModule):
             # Render Gaussians.
             extrinsics_list = []
             rgb_list = []
+            rgb_offset_list = [] # for saving offset-only results
             for target_view in range(v_tgt):
                 # test one by one
                 target_data = {
@@ -396,8 +475,14 @@ class ModelWrapper(LightningModule):
                 with self.benchmarker.time("encoder"):
                     encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump, target=target_data)
                     
-                pred_extrinsics_cwt = encoder_output['extrinsics']['cwt'] 
-                gaussians = encoder_output["gaussians"]
+                pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
+                curr_target_ext = pred_extrinsics_cwt[:, v_cxt:] # current target pose
+                with self.benchmarker.time("gaussian refining"):
+                    if self.test_cfg.with_offset_only:
+                        gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                    else:
+                        gaussians, _ = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                        offset_only_gaussians = None
 
                 if self.encoder.cfg.estimating_focal: 
                     pred_intrinsics_cwt = encoder_output['intrinsics']['cwt'] 
@@ -406,6 +491,16 @@ class ModelWrapper(LightningModule):
                 else:
                     target_intrinsics = target_data["intrinsics"]
 
+                if offset_only_gaussians is not None:
+                    out_offset = self.decoder.forward(
+                        offset_only_gaussians,
+                        pred_extrinsics_cwt[:, v_cxt:],
+                        target_intrinsics,
+                        batch["target"]["near"][:,target_view:target_view+1],
+                        batch["target"]["far"][:,target_view:target_view+1],
+                        (h, w),
+                    )
+                    rgb_offset_list.append(out_offset.color)
 
                 if self.test_cfg.align_pose:
                     output, updated_extrinsics = self.test_step_align(target_data, gaussians, target_intrinsics, initial_extrinsics=pred_extrinsics_cwt[:, v_cxt:])
@@ -428,6 +523,10 @@ class ModelWrapper(LightningModule):
             target_extrinsics =  torch.cat(extrinsics_list, dim=1) # (b, v, 4, 4)
             rgb_pred =  torch.cat(rgb_list, dim=1)[0] # (v, 3, h, w)
 
+            if rgb_offset_list:
+                rgb_offset_pred = torch.cat(rgb_offset_list, dim=1)[0] # (v, 3, h, w)
+            else:
+                rgb_offset_pred = None
 
         else:
             # Render Gaussians.
@@ -436,6 +535,13 @@ class ModelWrapper(LightningModule):
                 
 
             target_extrinsics = batch["target"]["extrinsics"]
+
+            with self.benchmarker.time("gaussian refining"):
+                if self.test_cfg.with_offset_only:
+                    gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                else:
+                    gaussians, _ = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                    offset_only_gaussians = None
 
             if self.encoder.cfg.estimating_focal: 
                 pred_intrinsics_cwt = encoder_output['intrinsics']['cwt'] 
@@ -461,6 +567,18 @@ class ModelWrapper(LightningModule):
                     )
             rgb_pred = output.color[0] # (v, 3, h, w)
 
+            if offset_only_gaussians is not None:
+                out_offset = self.decoder.forward(
+                    offset_only_gaussians,
+                    target_extrinsics,
+                    target_intrinsics,
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (h, w),
+                )
+                rgb_offset_pred = out_offset.color[0] # (v, 3, h, w)
+            else:
+                rgb_offset_pred = None
 
 
         (scene,) = batch["scene"]
@@ -508,14 +626,18 @@ class ModelWrapper(LightningModule):
         path = self.test_cfg.output_path / name
 
         if self.test_cfg.save_image:
-            # for index, context_gt in zip(batch["context"]["index"][0], batch["context"]["image"][0]):
-            #     save_image(context_gt, path / scene / f"context/{index:0>6}.png")
+            for index, context_gt in zip(batch["context"]["index"][0], batch["context"]["image"][0]):
+                save_image(context_gt, path / scene / f"context/{index:0>6}.png")
 
-            # for index, target_gt in zip(batch["target"]["index"][0], rgb_gt):
-            #     save_image(target_gt, path / scene / f"gt/{index:0>6}.png")
+            for index, target_gt in zip(batch["target"]["index"][0], rgb_gt):
+                save_image(target_gt, path / scene / f"gt/{index:0>6}.png")
 
             for index, pred in zip(batch["target"]["index"][0], rgb_pred):
                 save_image(pred, path / scene / f"color/{index:0>6}.png")
+
+            if rgb_offset_pred is not None:
+                for index, pred_offset in zip(batch["target"]["index"][0], rgb_offset_pred):
+                    save_image(pred_offset, path / scene / f"offset_only/{index:0>6}.png")
 
         if self.test_cfg.save_video:
             frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
@@ -703,8 +825,6 @@ class ModelWrapper(LightningModule):
             target_intrinsics = batch["target"]["intrinsics"]
             context_intrinsics = batch["context"]["intrinsics"]
 
-
-        gaussians = encoder_output['gaussians']
         show_context_render = True
 
         # Determine decoder inputs
@@ -714,21 +834,34 @@ class ModelWrapper(LightningModule):
         far = batch["target"]["far"] if not show_context_render else torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
         target_gt = batch["target"]["image"] if not show_context_render else torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
 
+        all_colors, all_depths = [], []
+        offset_colors = []
         # Run decoder
-        output = self.decoder.forward(
-            gaussians,
-            extrinsics,
-            intrinsics,
-            near,
-            far,
-            (h, w),
-            depth_mode=self.train_cfg.depth_mode,
-        )
+        for i in range(extrinsics.shape[1]):
+            curr_target_ext = extrinsics[:, i:i+1] # Pose of current view [B, 1, 4, 4]
+            gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
 
+            # Run decoder (current view rendering)
+            out = self.decoder.forward(
+                gaussians, curr_target_ext, intrinsics[:, i:i+1],
+                near[:, i:i+1], far[:, i:i+1], (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+            all_colors.append(out.color)
+            all_depths.append(out.depth)
+            
+            if offset_only_gaussians is not None:
+                out_offset = self.decoder.forward(
+                    offset_only_gaussians, curr_target_ext, intrinsics[:, i:i+1],
+                    near[:, i:i+1], far[:, i:i+1], (h, w)
+                )
+                offset_colors.append(out_offset.color)
+
+        output = type('Output', (), {'color': torch.cat(all_colors, dim=1), 'depth': torch.cat(all_depths, dim=1)})()
         
         # Compute validation metrics.
         rgb_gt = target_gt[0]
-        rgb_pred = output.color[0]
+        rgb_pred = output.color[0] # (v, 3, h, w)
         depth_pred = vis_depth_map(output.depth[0])
 
         if not show_context_render:
@@ -766,6 +899,13 @@ class ModelWrapper(LightningModule):
             add_label(vcat(*rgb_pred), f"Prediction"),
             add_label(vcat(*depth_pred), f"Depth")
         )
+
+        if offset_colors:
+            rgb_offset = torch.cat(offset_colors, dim=1)[0]
+            comparison = hcat(
+                comparison,
+                add_label(vcat(*rgb_offset), "Offset Only")
+            )
 
         if self.distiller is not None:
             with torch.no_grad():
@@ -923,7 +1063,6 @@ class ModelWrapper(LightningModule):
        
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump, target=None)
-        gaussians = encoder_output['gaussians']
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics = encoder_output['extrinsics']['c']
@@ -950,14 +1089,29 @@ class ModelWrapper(LightningModule):
         near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_frames)
         far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_frames)
 
+        # Refine and render Gaussians for each frame.
+        all_colors, all_depths = [], []
 
-        output = self.decoder.forward(
-            gaussians, extrinsics, intrinsics, near, far, (h, w), "depth"
-        )
+        for i in range(num_frames):
+            curr_ext = extrinsics[:, i:i+1]  # [B, 1, 4, 4]
+            curr_int = intrinsics[:, i:i+1]  # [B, 1, 3, 3]
+            curr_near = near[:, i:i+1]
+            curr_far = far[:, i:i+1]
+
+            gaussians, _ = self.get_refined_gaussians(encoder_output, curr_ext, h, w)
+
+            out = self.decoder.forward(
+                gaussians, curr_ext, curr_int, curr_near, curr_far, (h, w), "depth"
+            )
+            all_colors.append(out.color)
+            all_depths.append(out.depth)
+
+        output_color = torch.cat(all_colors, dim=1)
+        output_depth = torch.cat(all_depths, dim=1)
 
         images = [
             vcat(rgb, depth)
-            for rgb, depth in zip(output.color[0], vis_depth_map(output.depth[0]))
+            for rgb, depth in zip(output_color[0], vis_depth_map(output_depth[0]))
         ]
 
         video = torch.stack(images)
@@ -972,7 +1126,8 @@ class ModelWrapper(LightningModule):
 
         # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
         try:
-            wandb.log(visualizations)
+            if self.logger is not None and "WandbLogger" in type(self.logger).__name__:
+                wandb.log(visualizations)
         except Exception:
             assert isinstance(self.logger, LocalLogger)
             for key, value in visualizations.items():
@@ -1071,7 +1226,7 @@ class ModelWrapper(LightningModule):
             if not param.requires_grad:
                 continue
 
-            if "gaussian_param_head" in name or "intrinsic_encoder" in name or "pose_head" in name or "camera_head" in name:
+            if any(kw in name for kw in ["gaussian_param_head", "intrinsic_encoder", "pose_head", "camera_head", "view_dependent_head"]):
                 new_params.append(param)
                 new_param_names.append(name)
             else:
