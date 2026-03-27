@@ -74,6 +74,7 @@ Please refer to [DATASETS.md](DATASETS.md) for dataset preparation.
 ### Training
 1. Download the pre-trained checkpoints
 Download the following weights and place them in the `./pretrained_weights` directory:
+
 | Model | Source |
 | :---: | :---: |
 | **SPFSplat** | [Hugging Face](https://huggingface.co/RanranHuang/SPFSplat/tree/main) |
