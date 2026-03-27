@@ -22,13 +22,13 @@
       <a href="#pre-trained-checkpoints">Pre-trained Checkpoints</a>
     </li>
     <li>
-      <a href="#camera-conventions">Camera Conventions</a>
-    </li>
-    <li>
       <a href="#datasets">Datasets</a>
     </li>
     <li>
       <a href="#running-the-code">Running the Code</a>
+    </li>
+    <li>
+      <a href="#camera-conventions">Camera Conventions</a>
     </li>
     <li>
       <a href="#acknowledgements">Acknowledgements</a>
@@ -65,15 +65,14 @@ pip install --no-cache-dir --no-build-isolation -r requirements.txt
 ```
 
 ## Pre-trained Checkpoints
-
+Our models are hosted on [Hugging Face]
 
 ## Datasets
 Please refer to [DATASETS.md](DATASETS.md) for dataset preparation.
 
 ## Running the Code
 ### Training
-1. Download the pre-trained checkpoints
-Download the following weights and place them in the `./pretrained_weights` directory:
+1. Download the following pre-trained checkpoints and place them in the `./pretrained_weights` directory:
 
 | Model | Source |
 | :---: | :---: |
