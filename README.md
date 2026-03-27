@@ -1,7 +1,6 @@
 <p align="center">
   <h2 align="center"> ViewSplat <br> View-Adaptive Dynamic Gaussian Splatting for Feed-Forward Synthesis <br>
   <p align="center">
-    <strong>CVLAB-UOS</strong>
   </p>
   <h3 align="center">
     <a href="https://cvlab-uos.github.io/ViewSplat/">Project Page</a> |
