@@ -10,7 +10,7 @@
 </p>
 <p align="center">
   <a href="">
-    <img src="https://github.com/ranrhuang/ranrhuang.github.io/raw/master/spfsplatv2/static/image/framework.svg" alt="Teaser" width="90%">
+    <img src="https://github.com/user-attachments/files/26300992/architecture.pdf" alt="Teaser" width="90%">
   </a>
 </p>
 
