@@ -1,11 +1,11 @@
 <p align="center">
-  <h2 align="center"> ViewSplat <br> View-Adaptive Dynamic Gaussian Splatting for Feed-Forward Synthesis <br> from Sparse Views </h2>
+  <h2 align="center"> ViewSplat <br> View-Adaptive Dynamic Gaussian Splatting for Feed-Forward Synthesis <br>
   <p align="center">
     <strong>CVLAB-UOS</strong>
   </p>
   <h3 align="center">
     <a href="https://cvlab-uos.github.io/ViewSplat/">Project Page</a> |
-    <a href="https://github.com/cvlab-uos/ViewSplat">[Code]</a> |
+    <a href="https://github.com/cvlab-uos/ViewSplat">Code</a> |
     <a href="https://arxiv.org/abs/2603.25265">Paper</a>
   </h3>
 </p>
