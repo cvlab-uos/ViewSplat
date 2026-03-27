@@ -72,9 +72,9 @@ Our models are hosted on [Hugging Face](https://huggingface.co/myeon01/ViewSplat
 | [re10k_spf_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/re10k_spf_viewsplat.ckpt) | RE10K | 2 views, SPFSplat-based |
 | [acid_spf_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/acid_spf_viewsplat.ckpt) | ACID | 2 views, SPFSplat-based |
 | [re10k_spfv2_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/re10k_spfv2_viewsplat.ckpt) | RE10K | 2 views, SPFSplatV2-based |
-| [acid_spfv2_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/acid_spfv2_viewsplat.ckpt) | RE10K | 2 views, SPFSplatV2-based |
+| [acid_spfv2_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/acid_spfv2_viewsplat.ckpt) | ACID | 2 views, SPFSplatV2-based |
 | [re10k_spfv2l_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/re10k_spfv2l_viewsplat.ckpt) | RE10K | 2 views, SPFSplatV2-L-based |
-| [acid_spfv2l_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/acid_spfv2l_viewsplat.ckpt) | RE10K | 2 views, SPFSplatV2-L-based |
+| [acid_spfv2l_viewsplat.ckpt](https://huggingface.co/myeon01/ViewSplat/resolve/main/acid_spfv2l_viewsplat.ckpt) | ACID | 2 views, SPFSplatV2-L-based |
 
 We assume the downloaded weights are located in the `pretrained_weights` directory.
 
