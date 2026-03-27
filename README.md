@@ -8,6 +8,11 @@
     <a href="https://arxiv.org/abs/2603.25265">Paper</a>
   </h3>
 </p>
+<p align="center">
+  <a href="">
+    <img src="https://github.com/ranrhuang/ranrhuang.github.io/raw/master/spfsplatv2/static/image/framework.svg" alt="Teaser" width="90%">
+  </a>
+</p>
 
 **ViewSplat** is built upon the foundational work of [SPFSplatV2](https://github.com/ranrhuang/SPFSplatV2).
 
