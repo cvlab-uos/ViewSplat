@@ -5,7 +5,6 @@
   </p>
   <h3 align="center">
     <a href="https://cvlab-uos.github.io/ViewSplat/">Project Page</a> |
-    <a href="https://github.com/cvlab-uos/ViewSplat">Code</a> |
     <a href="https://arxiv.org/abs/2603.25265">Paper</a>
   </h3>
 </p>
@@ -73,26 +72,54 @@ Please refer to [DATASETS.md](DATASETS.md) for dataset preparation.
 
 ## Running the Code
 ### Training
-1. If using MASt3R-based architecture, download the [MASt3R](https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth) pretrained model and put it in the `./pretrained_weights` directory.
+1. Download the pre-trained checkpoints
+Download the following weights and place them in the `./pretrained_weights` directory:
+| Model | Source |
+| :--- | :--- |
+| **SPFSplat** | [Hugging Face](https://huggingface.co/RanranHuang/SPFSplat/tree/main) |
+| **SPFSplatV2** | [Hugging Face](https://huggingface.co/RanranHuang/SPFSplatV2/tree/main) |
+
+```bash
+mkdir -p pretrained_weights
+# After downloading, your directory should look like this:
+# ViewSplat/
+# └── pretrained_weights/
+#     ├── re10k_spfsplat.ckpt
+#     ├── re10k_spfsplatv2l.ckpt
+#     └── acid_spfsplatv2l.ckpt
+```
 
 2. Train with:
 
 ```bash
+# 2 view on RealEstate10K, SPFSplat-based architecture (Geometry Transformer: MASt3R)
+python -m src.main +experiment=spf_viewsplat/re10k wandb.mode=online wandb.name=re10k_spf_viewsplat
 
+# 2 view on RealEstate10K, SPFSplatV2-L-based architecture (Geometry Transformer: VGGT)
+python -m src.main +experiment=spfv2l_viewsplat/re10k wandb.mode=online wandb.name=re10k_spfv2l_viewsplat
 
+# 2 view on ACID, SPFSplatV2-L-based architecture (Geometry Transformer: VGGT)
+python -m src.main +experiment=spfv2l_viewsplat/acid wandb.mode=online wandb.name=acid_spfv2l_viewsplat
 ```
 
 ### Evaluation
-#### Novel View Synthesis and Pose Estimation on SPFSplatV2 (MASt3R-based architecture)
+#### Novel View Synthesis
 ```bash
+# 2 view on RealEstate10K, SPFSplatV2-L-based architecture
+python -m src.main +experiment=spfv2l_viewsplat/re10k mode=test wandb.name=re10k_spfv2l_viewsplat_test \
+  dataset/view_sampler@dataset.re10k.view_sampler=evaluation \
+  dataset.re10k.view_sampler.index_path=assets/evaluation_index_re10k.json \
+  checkpointing.load=./pretrained_weights/re10k_spfv2l_viewsplat.ckpt \
+  test.save_image=true test.with_offset_only=true
 
+# 2 view on ACID, SPFSplatV2-L-based architecture
+python -m src.main +experiment=spfv2l_viewsplat/acid mode=test wandb.name=acid_spfv2l_viewsplat_test \
+  dataset/view_sampler@dataset.re10k.view_sampler=evaluation \
+  dataset.re10k.view_sampler.index_path=assets/evaluation_index_acid.json \
+  checkpointing.load=./pretrained_weights/acid_spfv2l_viewsplat.ckpt \
+  test.save_image=true test.with_offset_only=true
 ```
 
-#### Novel View Synthesis and Pose Estimation on SPFSplatV2-L (VGGT-based architecture)
-```bash
-
-
-```
 
 ## Camera Conventions
 We follow the [pixelSplat](https://github.com/dcharatan/pixelsplat) camera system. The camera intrinsic matrices are normalized (the first row is divided by image width, and the second row is divided by image height).
@@ -105,5 +132,10 @@ This project is built upon [SPFSplatV2](https://github.com/ranrhuang/SPFSplatV2)
 ## Citation
 
 ```
-
+@article{Jeong2026viewsplat,
+      title={ViewSplat: View-Adaptive Dynamic Gaussian Splatting for Feed-Forward Synthesis},
+      author={Jeong, Moonyeon and Min, Seunggi and Lee, Suhyeon and Seong, Hongje},
+      journal={arXiv preprint arXiv: 2603.25265},
+      year={2026}
+}
 ```
