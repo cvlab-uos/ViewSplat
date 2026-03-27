@@ -5,6 +5,7 @@
   </p>
   <h3 align="center">
     <a href="https://cvlab-uos.github.io/ViewSplat/">Project Page</a> | 
+    <a href="https://arxiv.org/abs/2603.25265">Paper</a>
   </h3>
 </p>
 
