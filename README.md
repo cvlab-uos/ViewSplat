@@ -9,9 +9,13 @@
 </p>
 <p align="center">
   <a href="">
-    <img src="https://github.com/user-attachments/files/26300992/architecture.pdf" alt="Teaser" width="90%">
+    <img src="https://cvlab-uos.github.io/ViewSplat/static/images/intro_figure.png" alt="Overview of ViewSplat" width="90%">
   </a>
 </p>
+<p align="center">
+<strong>ViewSplat</strong> dynamically refines Gaussian attributes based on the target pose. <br> This allows for superior reconstruction of fine-grained details.
+</p>
+<br>
 
 **ViewSplat** is built upon the foundational work of [SPFSplatV2](https://github.com/ranrhuang/SPFSplatV2).
 
