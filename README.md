@@ -1,5 +1,5 @@
 <p align="center">
-  <h2 align="center"> ViewSplat <br> View-Adaptive Dynamic Gaussian Splatting for Feed-Forward Synthesis <br>
+  <h2 align="center"> ViewSplat: View-Adaptive Dynamic Gaussian Splatting <br> for Feed-Forward Synthesis <br>
   <p align="center">
   </p>
   <h3 align="center">
