@@ -110,11 +110,13 @@ body {
 .publication-body img {
 }
 
-.results-carousel {
+.videos-carousel,
+.imgaes-carousel {
   overflow: hidden;
 }
 
-.results-carousel .item {
+.videos-carousel .item,
+.images-carousel .item {
   margin: 5px;
   overflow: hidden;
   border: 1px solid #bbb;
@@ -123,8 +125,8 @@ body {
   font-size: 0;
 }
 
-.results-carousel video,
-.results-carousel img {
+.videos-carousel video,
+.images-carousel img {
   margin: 0 auto;
   display: block;
   width: 100%;
