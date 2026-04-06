@@ -640,12 +640,48 @@ class ModelWrapper(LightningModule):
                     save_image(pred_offset, path / scene / f"offset_only/{index:0>6}.png")
 
         if self.test_cfg.save_video:
-            frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
+            num_interp_frames = 30 
+            
+            v_cxt = batch["context"]["image"].shape[1]
+            if self.encoder.cfg.estimating_pose:
+                cxt_ext = encoder_output['extrinsics']['c'][:, :v_cxt]
+                cxt_int = encoder_output['intrinsics']['c'][:, :v_cxt] if self.encoder.cfg.estimating_focal else batch["context"]["intrinsics"]
+            else:
+                cxt_ext = batch["context"]["extrinsics"]
+                cxt_int = batch["context"]["intrinsics"]
 
+            t = torch.linspace(0, 1, num_interp_frames, dtype=torch.float32, device=self.device)
+            t = (torch.cos(torch.pi * (t + 1)) + 1) / 2 # Smooth interpolation
+            
+            interp_ext = interpolate_extrinsics(cxt_ext[0, 0], cxt_ext[0, -1], t)
+            interp_int = interpolate_intrinsics(cxt_int[0, 0], cxt_int[0, -1], t)
+            
+            near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_interp_frames)
+            far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_interp_frames)
+
+            interp_rgb_list = []
+            print(f"Rendering {num_interp_frames} frames for smooth looping video...")
+            
+            for i in range(num_interp_frames):
+                curr_ext = interp_ext[None, i:i+1]
+                curr_int = interp_int[None, i:i+1]
+                
+                gaussians, _ = self.get_refined_gaussians(encoder_output, curr_ext, h, w)
+                
+                out = self.decoder.forward(
+                    gaussians, curr_ext, curr_int, 
+                    near[:, i:i+1], far[:, i:i+1], (h, w)
+                )
+                interp_rgb_list.append(out.color[0, 0])
+
+            full_loop_list = interp_rgb_list + interp_rgb_list[::-1][1:-1]
+
+            frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
             save_video(
-                [a for a in rgb_pred],
-                path / "video" / f"{scene}_frame_{frame_str}.mp4",
+                full_loop_list,
+                path / "video" / f"{scene}_loop_{frame_str}.mp4",
             )
+            print(f"Saved smooth looping video to {path / 'video'}")
 
         if self.test_cfg.save_compare:
             # Construct comparison image.
