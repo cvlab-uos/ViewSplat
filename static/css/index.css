@@ -110,7 +110,12 @@ body {
 .publication-body img {
 }
 
-.videos-carousel,
+.videos-carousel{
+  overflow: hidden;
+  max-width: 700px;
+  margin: 0 auto;
+}
+
 .images-carousel {
   overflow: hidden;
 }
