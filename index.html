@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="description"
-        content="ViewSplat: A view-adaptive 3D Gaussian splatting network for high-fidelity novel view synthesis from unposed images using dynamic MLPs.">
+        content="ViewSplat: A view-adaptive 3D Gaussian splatting network for high-fidelity novel view synthesis from unposed images using scene-conditioned View MLPs.">
   <meta name="keywords" content="ViewSplat, 3D Gaussian Splatting, 3DGS, Novel View Synthesis, Pose-Free Reconstruction, Feed-Forward Synthesis, Computer Vision">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ViewSplat: View-Adaptive 3D Gaussian Splatting for Feed-Forward Synthesis</title>
@@ -176,15 +176,15 @@
             static Gaussian primitives that satisfy all viewpoints. 
           </p>
           <p>
-            To address this limitation, we shift the paradigm from static primitive regression to <strong>view-adaptive dynamic splatting</strong>.
+            To address this limitation, we shift the paradigm from static primitive regression to <strong>view-adaptive splatting</strong>.
             Instead of a rigid Gaussian representation, our pipeline learns a view-adaptable latent representation. Specifically, ViewSplat initially
-            predicts base Gaussian primitives alongside the weights of dynamic MLPs. During rendering, these MLPs take target view coordinates as input
+            predicts base Gaussian primitives alongside the weights of scene-conditioned View MLPs. During rendering, these MLPs take target view coordinates as input
             and predict view-dependent residual updates for each Gaussian attribute (i.e., 3D position, scale, rotation, opacity, and color). This mechanism,
-            which we term view-adaptive dynamic splatting, allows each primitive to rectify initial estimation errors, effectively capturing high-fidelity appearances. 
+            which we term view-adaptive splatting, allows each primitive to rectify initial estimation errors, effectively capturing high-fidelity appearances. 
           </p>
           <p>
-            Extensive experiments demonstrate that ViewSplat achieves state-of-the-art fidelity while maintaining fast inference (17 FPS) and
-            real-time rendering (154 FPS).
+            Extensive experiments demonstrate that ViewSplat achieves state-of-the-art fidelity while maintaining fast inference and
+            real-time rendering; our large backbone variant runs at 15 FPS inference and 90 FPS rendering.
           </p>
         </div>
       </div>
@@ -202,8 +202,8 @@
                style="width: 100%; height: auto; border-radius: 10px;">
           <p class="has-text-justified" style="margin-top: 10px;">
             <strong>Overview of ViewSplat.</strong>
-            While static 3D Gaussians (a) often result in blurred renderings, our ViewSplat (b) dynamically refines
-            Gaussian attributes based on the target pose. This allows for superior reconstruction of fine-grained details
+            While static 3D Gaussians (a) often result in blurred renderings, our ViewSplat (b) refines
+            Gaussian attributes based on the target pose on-the-fly. This allows for superior reconstruction of fine-grained details
             like sharp edges and specularities compared to existing methods.
           </p>
         </div>
@@ -217,7 +217,7 @@
           <p class="has-text-justified" style="margin-top: 10px;">
             <strong>Architecture of ViewSplat.</strong> 
             Our framework uses a shared Geometry Transformer backbone to jointly estimate camera poses and canonical 3D Gaussians
-            from unposed images. A specialized view-dependent head generates dynamic MLPs that predict pose-specific residual offsets,
+            from unposed images. A specialized view-dependent head generates per-pixel View MLPs that predict pose-specific residual offsets,
             refining Gaussian attributes during rendering to capture complex view-dependent effects.
           </p>
         </div>
