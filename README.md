@@ -150,10 +150,10 @@ This project is built upon [SPFSplatV2](https://github.com/ranrhuang/SPFSplatV2)
 ## Citation
 
 ```
-@article{Jeong2026viewsplat,
-      title={ViewSplat: View-Adaptive 3D Gaussian Splatting for Feed-Forward Synthesis},
+@inproceedings{jeong2026viewsplat,
+      title={{ViewSplat: View}-Adaptive {3D Gaussian} Splatting for Feed-Forward Synthesis},
       author={Jeong, Moonyeon and Min, Seunggi and Lee, Suhyeon and Seong, Hongje},
-      journal={arXiv preprint arXiv: 2603.25265},
+      booktitle={European Conference on Computer Vision (ECCV)},
       year={2026}
 }
 ```
