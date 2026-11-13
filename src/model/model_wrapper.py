@@ -202,13 +202,16 @@ class ModelWrapper(LightningModule):
         *,
         need_offset_only: bool = False,
     ):
-        """Build target-view Gaussians without materializing full per-pixel MLP weights."""
+        """Build target-view Gaussians using the selected view-dependent head."""
         has_view_refinement = (
             "vd_mlp_params" in encoder_output
             or "vd_mlp_features" in encoder_output
+            or "vd_direct_features" in encoder_output
         )
         if not has_view_refinement:
             return encoder_output["gaussians"], None
+        if target_pose.shape[1] != 1:
+            raise ValueError("View-dependent refinement expects one target pose at a time")
 
         raw_data = encoder_output["raw_data"]
         num_context_views = raw_data["pts3d"].shape[1]
@@ -226,7 +229,11 @@ class ModelWrapper(LightningModule):
             s=num_surfaces,
         )[:, :, :, 0]
 
-        if "vd_mlp_features" in encoder_output:
+        if "vd_direct_features" in encoder_output:
+            offset = self.compute_direct_regression_offset(
+                encoder_output["vd_direct_features"], relative_pose,
+            )
+        elif "vd_mlp_features" in encoder_output:
             offset = self.encoder.compute_view_dependent_offset_from_features(
                 encoder_output["vd_mlp_features"],
                 relative_pose,
@@ -257,6 +264,9 @@ class ModelWrapper(LightningModule):
         )
 
         def create_gaussians_obj(final_params):
+            # The per-pixel residual is shared across surfaces, including in
+            # the offset-only visualization passed to the Gaussian adapter.
+            final_params = final_params.expand_as(raw_data["params"])
             gaussians = self.encoder.gaussian_adapter.forward(
                 refined_pts3d.unsqueeze(-2),
                 mapped_opacities,
@@ -292,6 +302,29 @@ class ModelWrapper(LightningModule):
             create_gaussians_obj(params_offset) if need_offset_only else None
         )
         return refined_gaussians, offset_only_gaussians
+
+    def compute_direct_regression_offset(self, features, pose_input):
+        """Run pose-conditioned output convolutions on cached DPT features."""
+        with torch.amp.autocast("cuda", enabled=False):
+            if torch.is_tensor(features):
+                offset_map = self.encoder.view_dependent_head.forward_from_features(
+                    features.float(), pose_input.float(),
+                )
+                return rearrange(offset_map, "b v d h w -> b v (h w) d")
+
+            offsets = []
+            for view_index, view_features in enumerate(features):
+                head = (
+                    self.encoder.view_dependent_head
+                    if view_index == 0
+                    else self.encoder.view_dependent_head2
+                )
+                offset_map = head.forward_from_features(
+                    view_features.float(),
+                    pose_input[:, view_index].float(),
+                )
+                offsets.append(rearrange(offset_map, "b d h w -> b (h w) d"))
+        return torch.stack(offsets, dim=1)
 
     def expand_view_dependent_offset(self, offset):
         cfg = self.encoder.cfg

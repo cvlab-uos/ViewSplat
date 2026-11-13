@@ -8,9 +8,9 @@ from .dpt_gs_head import create_gs_dpt_head
 from .linear_head import LinearPts3d
 from .dpt_head import create_dpt_head
 from .pose_head import create_pose_head
-from .dpt_view_head import create_view_dpt_head
+from .dpt_view_head import create_view_dpt_head, create_direct_regression_dpt_head
 
-def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_init_t=False, use_homogeneous=True, concat_enc=True, mlp_dims=None): # Add mlp_dims
+def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_init_t=False, use_homogeneous=True, concat_enc=True, mlp_dims=None, view_offset_dims=None):
     """" build a prediction head for the decoder
     """
     if head_type == 'linear' and output_mode == 'pts3d':
@@ -26,6 +26,11 @@ def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3, pose_
     elif head_type == 'dpt' and output_mode == 'view_mlp':
         assert mlp_dims is not None, "view_mlp mode requires mlp_dims [in, hidden, out]"
         return create_view_dpt_head(net, mlp_dims=mlp_dims, postprocess_func=None)
+
+    elif head_type == 'dpt' and output_mode == 'direct_regression':
+        if view_offset_dims is None:
+            raise ValueError("direct_regression requires view_offset_dims [pose_dim, out_dim]")
+        return create_direct_regression_dpt_head(net, view_offset_dims, postprocess_func=None)
 
     else:
         raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")

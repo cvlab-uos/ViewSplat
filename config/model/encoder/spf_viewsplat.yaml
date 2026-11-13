@@ -45,6 +45,7 @@ pose_head:
   concat_enc: true
 
 use_view_dependent_head: true
+view_dependent_head_type: hypernetwork # hypernetwork | direct_regression
 view_dependent_update_scale: true
 view_dependent_update_rotation: true
 view_dependent_update_color: true

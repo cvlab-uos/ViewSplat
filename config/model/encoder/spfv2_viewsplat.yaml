@@ -47,5 +47,6 @@ pose_head:
   concat_enc: false
 
 use_view_dependent_head: true
+view_dependent_head_type: hypernetwork # hypernetwork | direct_regression
 vd_mlp_hidden_dim: 16
 vd_mlp_in_dim: 4

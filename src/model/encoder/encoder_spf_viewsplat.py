@@ -55,6 +55,8 @@ class EncoderSPF_ViewSplatCfg:
     vd_mlp_hidden_dim: int
     vd_mlp_in_dim: int
 
+    view_dependent_head_type: Literal["hypernetwork", "direct_regression"] = "hypernetwork"
+
     view_dependent_update_scale: bool = True
     view_dependent_update_rotation: bool = True
     view_dependent_update_color: bool = True
@@ -157,6 +159,17 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
                 "At least one view-dependent update must be enabled when "
                 "use_view_dependent_head is true."
             )
+        if cfg.view_dependent_head_type == "direct_regression":
+            view_offset_dims = [cfg.vd_mlp_in_dim, offset_dim]
+            self.view_dependent_head = head_factory(
+                'dpt', 'direct_regression', self.backbone, view_offset_dims=view_offset_dims,
+            )
+            self.view_dependent_head2 = head_factory(
+                'dpt', 'direct_regression', self.backbone, view_offset_dims=view_offset_dims,
+            )
+            return
+        if cfg.view_dependent_head_type != "hypernetwork":
+            raise ValueError(f"Unknown view_dependent_head_type: {cfg.view_dependent_head_type}")
         self.vd_mlp_dims = [
             cfg.vd_mlp_in_dim,
             cfg.vd_mlp_hidden_dim,
@@ -293,14 +306,17 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
                 )
 
             if self.cfg.use_view_dependent_head:
-                use_tiled_view_mlp = defer_view_mlp_projection
+                cache_view_features = (
+                    self.cfg.view_dependent_head_type == "direct_regression"
+                    or defer_view_mlp_projection
+                )
                 view_head = self.view_dependent_head
                 view_args = (
                     [tok[:, 0].float() for tok in dec_feat],
                     images[:, 0, :3],
                     shape[0, 0].cpu().tolist(),
                 )
-                if use_tiled_view_mlp:
+                if cache_view_features:
                     all_vd_features.append(view_head.forward_features(*view_args))
                 else:
                     view_params = view_head(*view_args)
@@ -315,7 +331,7 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
                         images[:, i, :3],
                         shape[0, i].cpu().tolist(),
                     )
-                    if use_tiled_view_mlp:
+                    if cache_view_features:
                         all_vd_features.append(view_head.forward_features(*view_args))
                     else:
                         view_params = view_head(*view_args)
@@ -476,11 +492,14 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
             )
 
         if self.cfg.use_view_dependent_head:
-            if defer_view_mlp_projection:
+            if self.cfg.view_dependent_head_type == "direct_regression":
+                encoder_output["vd_direct_features"] = all_vd_features
+            elif defer_view_mlp_projection:
                 encoder_output["vd_mlp_features"] = all_vd_features
             else:
                 encoder_output["vd_mlp_params"] = torch.stack(all_vd_params, dim=1)
-            encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
+            if self.cfg.view_dependent_head_type == "hypernetwork":
+                encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
             encoder_output["raw_data"] = {
                 "pts3d": pts_all,
                 "opacities": raw_densities,

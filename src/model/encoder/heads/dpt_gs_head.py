@@ -12,6 +12,7 @@ from einops import rearrange
 from typing import List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # import dust3r.utils.path_to_croco
 from .dpt_block import DPTOutputAdapter, Interpolate, make_fusion_block
 from .head_modules import UnetExtractor
@@ -74,8 +75,22 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
 
         return path_1
 
-    def forward(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None, conf=None):
+    def forward(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None, conf=None, conditioning=None):
         path_1 = self._forward_features(encoder_tokens, imgs, image_size)
+        return self.forward_from_features(path_1, conditioning)
+
+    def forward_from_features(self, path_1, conditioning=None):
+        """Apply output convolutions to an already decoded DPT feature map."""
+        if conditioning is not None:
+            conditioning = conditioning.to(device=path_1.device, dtype=path_1.dtype)
+            if conditioning.shape[-2:] != path_1.shape[-2:]:
+                conditioning = F.interpolate(
+                    conditioning,
+                    size=path_1.shape[-2:],
+                    mode="bilinear",
+                    align_corners=True,
+                )
+            path_1 = torch.cat([path_1, conditioning], dim=1)
         out = self.head(path_1)
         return out
 

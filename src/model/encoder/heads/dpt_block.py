@@ -289,6 +289,7 @@ class DPTOutputAdapter(nn.Module):
                  use_bn: bool = False,
                  dim_tokens_enc: Optional[int] = None,
                  head_type: str = 'regression',
+                 condition_dim: int = 0,
                  output_width_ratio=1,
                  **kwargs):
         super().__init__()
@@ -341,10 +342,10 @@ class DPTOutputAdapter(nn.Module):
                 nn.Dropout(0.1, False),
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
             )
-        # Add 'view_mlp' head type for view-dependent MLP parameter generation 
-        elif self.head_type == 'view_mlp':
+        # Dynamic MLP parameters or pose-conditioned direct Gaussian offsets.
+        elif self.head_type in ('view_mlp', 'view_offset'):
             self.head = nn.Sequential(
-                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(feature_dim + condition_dim, feature_dim, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(feature_dim) if use_bn else nn.Identity(),
                 nn.ReLU(True),
                 # Add an extra convolution layer to increase depth and enhance parameter expressivity
@@ -354,7 +355,7 @@ class DPTOutputAdapter(nn.Module):
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1, stride=1, padding=0)
             )
         else:
-            raise ValueError('DPT head_type must be "regression" or "semseg".')
+            raise ValueError(f'Unsupported DPT head_type: {self.head_type}')
 
         if self.dim_tokens_enc is not None:
             self.init(dim_tokens_enc=dim_tokens_enc)

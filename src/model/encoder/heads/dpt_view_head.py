@@ -69,6 +69,39 @@ class DPTViewHead(PixelwiseTaskWithDPT):
 
 
 
+class DPTDirectRegressionHead(PixelwiseTaskWithDPT):
+    """Decode context features once, then predict residuals for each target pose."""
+
+    def __init__(self, view_offset_dims, **kwargs):
+        self.pose_dim, self.out_dim = view_offset_dims
+        super().__init__(
+            num_channels=self.out_dim,
+            head_type='view_offset',
+            condition_dim=self.pose_dim,
+            **kwargs,
+        )
+        # Start from the base Gaussians, just as the hypernetwork path does.
+        nn.init.zeros_(self.dpt.head[-1].weight)
+        nn.init.zeros_(self.dpt.head[-1].bias)
+
+    def forward(self, x, imgs, img_info, pose_input):
+        return self.forward_from_features(self.forward_features(x, imgs, img_info), pose_input)
+
+    def forward_features(self, x, imgs, img_info):
+        """Return pose-independent F, retaining its graph for training."""
+        return self.dpt._forward_features(x, imgs, image_size=(img_info[0], img_info[1]))
+
+    def forward_from_features(self, features, pose_input):
+        h, w = features.shape[-2:]
+        if pose_input.ndim == 3:
+            pose_input = rearrange(pose_input, "b (h w) d -> b d h w", h=h, w=w)
+        elif pose_input.ndim == 4 and pose_input.shape[-1] == self.pose_dim:
+            pose_input = rearrange(pose_input, "b h w d -> b d h w")
+        if pose_input.ndim != 4 or pose_input.shape[1] != self.pose_dim:
+            raise ValueError(f"Expected a {self.pose_dim}-channel pose map, got {pose_input.shape}")
+        return self.dpt.forward_from_features(features, conditioning=pose_input)
+
+
 def create_view_dpt_head(net, mlp_dims, postprocess_func=postprocess):
     l2 = net.dec_depth
     return DPTViewHead(
@@ -80,4 +113,18 @@ def create_view_dpt_head(net, mlp_dims, postprocess_func=postprocess):
         postprocess=postprocess_func,
         depth_mode=net.depth_mode,
         conf_mode=net.conf_mode
+    )
+
+
+def create_direct_regression_dpt_head(net, view_offset_dims, postprocess_func=postprocess):
+    l2 = net.dec_depth
+    return DPTDirectRegressionHead(
+        view_offset_dims=view_offset_dims,
+        feature_dim=256,
+        last_dim=128,
+        hooks_idx=[0, l2*2//4, l2*3//4, l2],
+        dim_tokens=[net.enc_embed_dim, net.dec_embed_dim, net.dec_embed_dim, net.dec_embed_dim],
+        postprocess=postprocess_func,
+        depth_mode=net.depth_mode,
+        conf_mode=net.conf_mode,
     )

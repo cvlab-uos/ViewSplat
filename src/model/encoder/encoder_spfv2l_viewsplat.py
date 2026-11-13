@@ -57,6 +57,8 @@ class EncoderSPFV2L_ViewSplatCfg:
     vd_mlp_hidden_dim: int
     vd_mlp_in_dim: int
 
+    view_dependent_head_type: Literal["hypernetwork", "direct_regression"] = "hypernetwork"
+
     pretrained_weights: str = ""
     pose_free: bool = True
     pose_make_baseline_1: bool = True
@@ -118,6 +120,15 @@ class EncoderSPFV2L_ViewSplat(Encoder[EncoderSPFV2L_ViewSplatCfg]):
         if not cfg.use_view_dependent_head:
             self.view_dependent_head = None
             return
+
+        if cfg.view_dependent_head_type == "direct_regression":
+            self.view_dependent_head = DPTViewHead(
+                dim_in=2 * self.embed_dim,
+                view_offset_dims=[cfg.vd_mlp_in_dim, self.raw_gs_dim + 3],
+            )
+            return
+        if cfg.view_dependent_head_type != "hypernetwork":
+            raise ValueError(f"Unknown view_dependent_head_type: {cfg.view_dependent_head_type}")
 
         # MLP structure definition: [Pose_In, Hidden, GS_Offset]
         # Assuming all parameters include gaussian centers(pts3d): mean, scale, rotation, color, opacity -> 86
@@ -225,7 +236,14 @@ class EncoderSPFV2L_ViewSplat(Encoder[EncoderSPFV2L_ViewSplatCfg]):
         pts_all = pts_all.unsqueeze(-2)
 
         if self.cfg.use_view_dependent_head:
-            if defer_view_mlp_projection:
+            if self.cfg.view_dependent_head_type == "direct_regression":
+                with torch.amp.autocast("cuda", enabled=False):
+                    vd_features = self.view_dependent_head.forward_features(
+                        [tokens.float() for tokens in context_tokens],
+                        context["image"].float(),
+                        ps_idx,
+                    )
+            elif defer_view_mlp_projection:
                 vd_features = self.view_dependent_head.forward_features(
                     context_tokens,
                     context["image"],
@@ -322,11 +340,14 @@ class EncoderSPFV2L_ViewSplat(Encoder[EncoderSPFV2L_ViewSplatCfg]):
             )
 
         if self.cfg.use_view_dependent_head:
-            if defer_view_mlp_projection:
+            if self.cfg.view_dependent_head_type == "direct_regression":
+                encoder_output["vd_direct_features"] = vd_features
+            elif defer_view_mlp_projection:
                 encoder_output["vd_mlp_features"] = vd_features
             else:
                 encoder_output["vd_mlp_params"] = vd_params
-            encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
+            if self.cfg.view_dependent_head_type == "hypernetwork":
+                encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
             encoder_output["raw_data"] = {
                 "pts3d": pts_all,
                 "opacities": raw_densities,
