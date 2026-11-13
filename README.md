@@ -139,51 +139,6 @@ python -m src.main +experiment=spfv2l_viewsplat/acid mode=test wandb.name=acid_s
 ```
 
 
-### Direct regression ablation
-
-All three encoders (`spf_viewsplat`, `spfv2_viewsplat`, and `spfv2l_viewsplat`)
-support `model.encoder.view_dependent_head_type=direct_regression`. The default
-is `hypernetwork`, which predicts per-Gaussian view MLPs once and evaluates them
-for each target pose.
-
-The direct variant decodes the context tokens and images into a pose-independent
-DPT feature map `F` once per encoder call and caches `F` in the encoder output.
-For each target pose, it concatenates the per-Gaussian pose input with the cached
-`F` and runs only the output convolutions to predict residuals. Training retains
-the cache's computation graph so all target losses backpropagate through the same
-DPT decode; the cache is scoped to that encoder output.
-It predicts Gaussian residuals directly, using the same direction and log-distance
-pose input, zero residual initialization, and Gaussian refinement as the hypernetwork.
-This preserves the `ViewSplat_direct` architecture and checkpoint shapes while
-removing repeated pose-independent DPT work. DPT feature extraction is included
-in `encoder` timings; per-target output convolutions and Gaussian updates are
-included in `gaussian refining` timings. `vd_mlp_in_dim` specifies the pose input dimension (4) for both modes;
-`vd_mlp_hidden_dim` only applies to the hypernetwork.
-
-```bash
-# MASt3R: train the direct regression variant
-python -m src.main +experiment=spf_viewsplat/re10k \
-  model.encoder.view_dependent_head_type=direct_regression \
-  wandb.name=re10k_spf_viewsplat_direct_regression
-
-# VGGT: train the direct regression variant
-python -m src.main +experiment=spfv2l_viewsplat/re10k \
-  model.encoder.view_dependent_head_type=direct_regression \
-  wandb.name=re10k_spfv2l_viewsplat_direct_regression
-
-# Evaluate with a checkpoint trained using direct regression
-python -m src.main +experiment=spfv2l_viewsplat/re10k mode=test \
-  model.encoder.view_dependent_head_type=direct_regression \
-  dataset/view_sampler@dataset.re10k.view_sampler=evaluation \
-  dataset.re10k.view_sampler.index_path=assets/evaluation_index_re10k.json \
-  checkpointing.load=./pretrained_weights/re10k_spfv2l_viewsplat_direct_regression.ckpt
-```
-
-The two modes have different view-head weight shapes, so select the matching mode
-when loading a ViewSplat checkpoint. Training can use the same base SPFSplat weights
-as the corresponding hypernetwork experiment. SPF's `view_dependent_update_*`
-switches also apply to direct regression.
-
 ## Camera Conventions
 We follow the [pixelSplat](https://github.com/dcharatan/pixelsplat) camera system. The camera intrinsic matrices are normalized (the first row is divided by image width, and the second row is divided by image height).
 The camera extrinsic matrices are OpenCV-style camera-to-world matrices ( +X right, +Y down, +Z camera looks into the screen).
