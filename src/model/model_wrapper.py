@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable, Any, Dict
 
@@ -192,64 +193,144 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
-    def get_refined_gaussians(self, encoder_output, target_pose, h, w):
-        """
-        encoder_output: Dictionary containing vd_mlp_params, raw_data, etc.
-        target_pose: Camera extrinsic(pose) for the current rendering(target) view [B, 1, 4, 4]
-        """
-        if "vd_mlp_params" not in encoder_output:
+    def get_refined_gaussians(
+        self,
+        encoder_output,
+        target_pose,
+        h,
+        w,
+        *,
+        need_offset_only: bool = False,
+    ):
+        """Build target-view Gaussians without materializing full per-pixel MLP weights."""
+        has_view_refinement = (
+            "vd_mlp_params" in encoder_output
+            or "vd_mlp_features" in encoder_output
+        )
+        if not has_view_refinement:
             return encoder_output["gaussians"], None
 
-        vd_params = encoder_output["vd_mlp_params"] # [B, V_cxt, N, C]
-        V_cxt = vd_params.shape[1]
-        S = self.encoder.cfg.num_surfaces
-        
-        vd_params_5d = rearrange(vd_params, "b v (h w) c -> b v c h w", h=h, w=w) # [B, V_cxt, C, H, W]
-        pts3d_flat = rearrange(encoder_output["raw_data"]["pts3d"], "b v n s d -> b (v n s) d") # [B, N_total, 3]
-        
-        # Compute relative pose input with regard to current extrinsic
-        vd_input = self.encoder.get_relative_pose_input(target_pose, pts3d_flat.unsqueeze(1)) # [B, 1, V_cxt*N*S, 4]
-        # vd_input rearrange
-        vd_input_aligned = rearrange(vd_input.squeeze(1), "b (v n s) d -> b v n s d", v=V_cxt, s=S)
-        vd_input_final = vd_input_aligned[:, :, :, 0, :] # Use first surface: [B, V_cxt, N, 4]
+        raw_data = encoder_output["raw_data"]
+        num_context_views = raw_data["pts3d"].shape[1]
+        num_surfaces = self.encoder.cfg.num_surfaces
+        pts3d_flat = rearrange(raw_data["pts3d"], "b v n s d -> b (v n s) d")
 
-        # Compute gaussian parameter offsets (Dimension: 86)
-        offset = self.encoder.compute_view_dependent_offset(vd_params_5d, vd_input_final, encoder_output["vd_mlp_dims"]) # [B, V-cxt, N, ou_d=86]
+        relative_pose = self.encoder.get_relative_pose_input(
+            target_pose,
+            pts3d_flat.unsqueeze(1),
+        )
+        relative_pose = rearrange(
+            relative_pose.squeeze(1),
+            "b (v n s) d -> b v n s d",
+            v=num_context_views,
+            s=num_surfaces,
+        )[:, :, :, 0]
 
-        # Slice offsets (3 for mean, 1 for opacity, 82 for params)
-        # Apply unsqueeze(-2) to align with the Surface (S) dimension, resulting in a [B, V, N, 1, D] shape.
-        means_offset   = offset[..., :3].unsqueeze(-2)    # [B, V, N, 1, 3]
-        opacity_offset = offset[..., 3:4].unsqueeze(-2)  # [B, V, N, 1, 1]
-        params_offset  = offset[..., 4:].unsqueeze(-2)   # [B, V, N, 1, 82]
+        if "vd_mlp_features" in encoder_output:
+            offset = self.encoder.compute_view_dependent_offset_from_features(
+                encoder_output["vd_mlp_features"],
+                relative_pose,
+                encoder_output["vd_mlp_dims"],
+            )
+        else:
+            view_parameters = rearrange(
+                encoder_output["vd_mlp_params"],
+                "b v (h w) c -> b v c h w",
+                h=h,
+                w=w,
+            )
+            offset = self.encoder.compute_view_dependent_offset(
+                view_parameters,
+                relative_pose,
+                encoder_output["vd_mlp_dims"],
+            )
 
-        # Apply offsets to raw data
-        # pts3d: [B, V, N, S, 3], opacities: [B, V, N, S, 1], params: [B, V, N, S, 82]
-        refined_pts3d = encoder_output["raw_data"]["pts3d"] + means_offset
-        refined_opacities = encoder_output["raw_data"]["opacities"] + opacity_offset.squeeze(-1)
-        refined_opacities_sig = refined_opacities.sigmoid().unsqueeze(-1)
-        refined_params = encoder_output["raw_data"]["params"] + params_offset
-        
-        # Helper function to generate final Gaussians object via the Gaussian Adapter
+        means_offset, opacity_offset, params_offset = (
+            self.expand_view_dependent_offset(offset)
+        )
+
+        refined_pts3d = raw_data["pts3d"] + means_offset
+        refined_opacities = (raw_data["opacities"] + opacity_offset).sigmoid().unsqueeze(-1)
+        mapped_opacities = self.encoder.map_pdf_to_opacity(
+            refined_opacities,
+            self.global_step,
+        )
+
         def create_gaussians_obj(final_params):
             gaussians = self.encoder.gaussian_adapter.forward(
-                refined_pts3d.unsqueeze(-2), # [B, V, N, S, 1, 3]
-                self.encoder.map_pdf_to_opacity(refined_opacities_sig, self.global_step),
-                rearrange(final_params, "b v n s c -> b v n s () c")
+                refined_pts3d.unsqueeze(-2),
+                mapped_opacities,
+                rearrange(final_params, "b v n s c -> b v n s () c"),
+                build_covariances=False,
             )
             return Gaussians(
-                means=rearrange(gaussians.means, "b v n s spp xyz -> b (v n s spp) xyz"),
-                covariances=rearrange(gaussians.covariances, "b v n s spp i j -> b (v n s spp) i j"),
-                rotations=rearrange(gaussians.rotations, "b v n s spp i -> b (v n s spp) i"),
-                scales=rearrange(gaussians.scales, "b v n s spp i -> b (v n s spp) i"),
-                harmonics=rearrange(gaussians.harmonics, "b v n s spp c d_sh -> b (v n s spp) c d_sh"),
-                opacities=rearrange(gaussians.opacities, "b v n s spp -> b (v n s spp)")
+                means=rearrange(
+                    gaussians.means,
+                    "b v n s spp xyz -> b (v n s spp) xyz",
+                ),
+                covariances=None,
+                rotations=rearrange(
+                    gaussians.rotations,
+                    "b v n s spp i -> b (v n s spp) i",
+                ),
+                scales=rearrange(
+                    gaussians.scales,
+                    "b v n s spp i -> b (v n s spp) i",
+                ),
+                harmonics=rearrange(
+                    gaussians.harmonics,
+                    "b v n s spp c d_sh -> b (v n s spp) c d_sh",
+                ),
+                opacities=rearrange(
+                    gaussians.opacities,
+                    "b v n s spp -> b (v n s spp)",
+                ),
             )
 
-        # Generate refined_gaussians and offset_only_gaussians
-        refined_gaussians = create_gaussians_obj(refined_params)
-        offset_only_gaussians = create_gaussians_obj(params_offset)
-
+        refined_gaussians = create_gaussians_obj(raw_data["params"] + params_offset)
+        offset_only_gaussians = (
+            create_gaussians_obj(params_offset) if need_offset_only else None
+        )
         return refined_gaussians, offset_only_gaussians
+
+    def expand_view_dependent_offset(self, offset):
+        cfg = self.encoder.cfg
+        update_mean = getattr(cfg, "view_dependent_update_mean", True)
+        update_opacity = getattr(cfg, "view_dependent_update_opacity", True)
+        update_scale = getattr(cfg, "view_dependent_update_scale", True)
+        update_rotation = getattr(cfg, "view_dependent_update_rotation", True)
+        update_color = getattr(cfg, "view_dependent_update_color", True)
+
+        offset_index = 0
+
+        def consume_offset(size, enabled):
+            nonlocal offset_index
+            if not enabled:
+                return offset.new_zeros(*offset.shape[:-1], size)
+
+            value = offset[..., offset_index:offset_index + size]
+            offset_index += size
+            return value
+
+        means_offset = consume_offset(3, update_mean).unsqueeze(-2)
+        opacity_offset = consume_offset(1, update_opacity)
+        scale_offset = consume_offset(3, update_scale)
+        rotation_offset = consume_offset(4, update_rotation)
+        color_dim = self.encoder.gaussian_adapter.d_in - 7
+        color_offset = consume_offset(color_dim, update_color)
+
+        if offset_index != offset.shape[-1]:
+            raise RuntimeError(
+                "Unexpected view-dependent offset dim: "
+                f"consumed {offset_index}, got {offset.shape[-1]}"
+            )
+
+        params_offset = torch.cat(
+            [scale_offset, rotation_offset, color_offset],
+            dim=-1,
+        ).unsqueeze(-2)
+        return means_offset, opacity_offset, params_offset
+
 
     # For reprojection loss ablation (Compute reprojection loss with refined Gaussian centers)
     # def get_refined_pts3d(self, encoder_output, target_pose, h, w):
@@ -319,7 +400,24 @@ class ModelWrapper(LightningModule):
 
         # Run the model.
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump, target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_kwargs = {}
+        if self.encoder.cfg.name in {
+            "spf_viewsplat",
+            "spfv2_viewsplat",
+            "spfv2l_viewsplat",
+        }:
+            encoder_kwargs = {
+                "build_base_gaussians": not self.encoder.cfg.use_view_dependent_head,
+                "visualization_keys": {"means"},
+                "defer_view_mlp_projection": self.encoder.cfg.use_view_dependent_head,
+            }
+        encoder_output = self.encoder(
+            batch["context"],
+            self.global_step,
+            visualization_dump=visualization_dump,
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+            **encoder_kwargs,
+        )
 
 
         if self.encoder.cfg.estimating_pose:
@@ -346,8 +444,9 @@ class ModelWrapper(LightningModule):
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
         target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
 
-        # View-dependent refinement loop
-        all_colors, all_depths = [], []
+        # View-dependent refinement loop. Training losses only consume RGB, so do
+        # not retain every full-resolution depth tensor in the autograd graph.
+        all_colors = []
 
         # Real-time gaussian refinement and rendering per view (v)
         for i in range(extrinsics.shape[1]):
@@ -361,14 +460,13 @@ class ModelWrapper(LightningModule):
                 depth_mode=self.train_cfg.depth_mode,
             )
             all_colors.append(out.color)
-            all_depths.append(out.depth)
+            del out
 
         # Concat results [B, V, C, H, W]
         output_color = torch.cat(all_colors, dim=1)
-        output_depth = torch.cat(all_depths, dim=1)
         class Output: pass # Duck typing for compatibility with existing output objects
         output = Output()
-        output.color, output.depth = output_color, output_depth
+        output.color, output.depth = output_color, None
 
         # Compute PSNR
         psnr = compute_psnr(
@@ -517,7 +615,9 @@ class ModelWrapper(LightningModule):
                 curr_target_ext = pred_extrinsics_cwt[:, v_cxt:] # current target pose
                 with self.benchmarker.time("gaussian refining"):
                     if self.test_cfg.with_offset_only:
-                        gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                        gaussians, offset_only_gaussians = self.get_refined_gaussians(
+                            encoder_output, curr_target_ext, h, w, need_offset_only=True
+                        )
                     else:
                         gaussians, _ = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
                         offset_only_gaussians = None
@@ -576,7 +676,9 @@ class ModelWrapper(LightningModule):
 
             with self.benchmarker.time("gaussian refining"):
                 if self.test_cfg.with_offset_only:
-                    gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+                    gaussians, offset_only_gaussians = self.get_refined_gaussians(
+                        encoder_output, curr_target_ext, h, w, need_offset_only=True
+                    )
                 else:
                     gaussians, _ = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
                     offset_only_gaussians = None
@@ -913,7 +1015,9 @@ class ModelWrapper(LightningModule):
         # Run decoder
         for i in range(extrinsics.shape[1]):
             curr_target_ext = extrinsics[:, i:i+1] # Pose of current view [B, 1, 4, 4]
-            gaussians, offset_only_gaussians = self.get_refined_gaussians(encoder_output, curr_target_ext, h, w)
+            gaussians, offset_only_gaussians = self.get_refined_gaussians(
+                encoder_output, curr_target_ext, h, w, need_offset_only=True
+            )
 
             # Run decoder (current view rendering)
             out = self.decoder.forward(
@@ -1340,42 +1444,55 @@ class ModelWrapper(LightningModule):
         }
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, **kwargs):
-        # Perform the backward pass
         optimizer_closure()
+
+        max_grad_norm = 20 if "vggt" in self.encoder.backbone.cfg.name else 5
+        named_gradients = [
+            (name, parameter.grad)
+            for name, parameter in self.named_parameters()
+            if parameter.grad is not None
+        ]
+        if named_gradients:
+            # A single device-to-host synchronization replaces several syncs per
+            # parameter while preserving the existing skip-update policy.
+            maxima = torch.stack(
+                [gradient.detach().abs().amax() for _, gradient in named_gradients]
+            ).cpu().tolist()
+        else:
+            maxima = []
 
         nan_detected = False
         large_detected = False
-        
-        max_grad_norm = 20 if 'vggt' in self.encoder.backbone.cfg.name else 5   # Define the maximum norm threshold
-        max_grad_value = 0  
+        max_grad_value = 0.0
+        for (name, _), parameter_max in zip(named_gradients, maxima):
+            if math.isnan(parameter_max):
+                self.log(
+                    "nan_gradient_detected",
+                    True,
+                    on_step=True,
+                    on_epoch=False,
+                )
+                print("Skipping update due to NaN gradient")
+                nan_detected = True
+                break
 
-        # Check for NaN gradients
-        for name, param in self.named_parameters():
+            max_grad_value = max(max_grad_value, parameter_max)
+            if parameter_max > max_grad_norm:
+                self.log(
+                    f"large_gradient_detected in {name}",
+                    parameter_max,
+                    on_step=True,
+                    on_epoch=False,
+                )
+                print(f"large gradient in {name}")
+                large_detected = True
+                break
 
-            if param.grad is not None:
-                if torch.isnan(param.grad).any():
-                    self.log("nan_gradient_detected", True, on_step=True, on_epoch=False)
-                    print(f"Skipping update due to NaN gradient")
-                    nan_detected = True
-                    break
-
-                param_max_grad = param.grad.abs().max().item()
-                if param_max_grad > max_grad_value:
-                    max_grad_value = param_max_grad
-
-                if param.grad.abs().max() > max_grad_norm:  
-                    self.log(f"large_gradient_detected in {name}", param.grad.abs().max().item(), on_step=True, on_epoch=False)
-                    print(f"large gradient in {name}")
-                    large_detected = True
-                    break
-        
         self.log("max_gradient", max_grad_value, on_step=True, on_epoch=False)
 
         if nan_detected or large_detected:
-            optimizer.zero_grad()  # Clear gradients if skipping the step
+            optimizer.zero_grad(set_to_none=True)
         else:
-            # Clip gradients to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
             optimizer.step()
-            optimizer.zero_grad()
-
+            optimizer.zero_grad(set_to_none=True)

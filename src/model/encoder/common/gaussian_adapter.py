@@ -15,7 +15,7 @@ from .gaussians import build_covariance
 @dataclass
 class Gaussians:
     means: Float[Tensor, "*batch 3"]
-    covariances: Float[Tensor, "*batch 3 3"]
+    covariances: Float[Tensor, "*batch 3 3"] | None
     scales: Float[Tensor, "*batch 3"]
     rotations: Float[Tensor, "*batch 4"]
     harmonics: Float[Tensor, "*batch 3 _"]
@@ -57,6 +57,7 @@ class GaussianAdapter(nn.Module):
         raw_gaussians: Float[Tensor, "*#batch _"],
         image_shape: tuple[int, int],
         eps: float = 1e-8,
+        build_covariances: bool = True,
     ) -> Gaussians:
         device = extrinsics.device
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
@@ -76,10 +77,17 @@ class GaussianAdapter(nn.Module):
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
 
-        # Create world-space covariance matrices.
-        covariances = build_covariance(scales, rotations)
-        c2w_rotations = extrinsics[..., :3, :3]
-        covariances = c2w_rotations @ covariances @ c2w_rotations.transpose(-1, -2)
+        # CUDA splatting consumes scales and rotations directly. Keep covariance
+        # construction optional for export/visualization callers that need it.
+        covariances = None
+        if build_covariances:
+            covariances = build_covariance(scales, rotations)
+            c2w_rotations = extrinsics[..., :3, :3]
+            covariances = (
+                c2w_rotations
+                @ covariances
+                @ c2w_rotations.transpose(-1, -2)
+            )
 
         # Compute Gaussian means.
         origins, directions = get_world_rays(coordinates, extrinsics, intrinsics)
@@ -126,6 +134,7 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         opacities: Float[Tensor, "*#batch"],
         raw_gaussians: Float[Tensor, "*#batch _"],
         eps: float = 1e-8,
+        build_covariances: bool = True,
     ) -> Gaussians:
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
 
@@ -138,7 +147,9 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
 
-        covariances = build_covariance(scales, rotations)
+        covariances = (
+            build_covariance(scales, rotations) if build_covariances else None
+        )
 
         return Gaussians(
             means=means,

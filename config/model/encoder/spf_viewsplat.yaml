@@ -45,5 +45,10 @@ pose_head:
   concat_enc: true
 
 use_view_dependent_head: true
+view_dependent_update_scale: true
+view_dependent_update_rotation: true
+view_dependent_update_color: true
+view_dependent_update_opacity: true
+view_dependent_update_mean: true
 vd_mlp_hidden_dim: 16
 vd_mlp_in_dim: 4

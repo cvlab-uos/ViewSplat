@@ -50,7 +50,6 @@ def render_cuda(
     image_shape: tuple[int, int],
     background_color: Float[Tensor, "batch 3"],
     gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
     gaussian_rotations: Float[Tensor, "batch gaussian 4"],
@@ -67,7 +66,6 @@ def render_cuda(
         scale = 1 / near
         extrinsics = extrinsics.clone()
         extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
-        gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
         gaussian_means = gaussian_means * scale[:, None, None]
         gaussian_scales = gaussian_scales * scale[:, None, None]
         near = near * scale
@@ -88,10 +86,11 @@ def render_cuda(
     projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
     projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
     view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
-    full_projection = view_matrix @ projection_matrix
+    # The rasterizer settings require Python floats. Copy all FOV values to
+    # the host at once instead of synchronizing the CUDA stream once per view.
+    tan_fov_values = torch.stack((tan_fov_x, tan_fov_y), dim=-1).detach().cpu().tolist()
 
     all_images = []
-    all_radii = []
     all_depths = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
@@ -105,8 +104,8 @@ def render_cuda(
         settings = GaussianRasterizationSettings(
             image_height=h,
             image_width=w,
-            tanfovx=tan_fov_x[i].item(),
-            tanfovy=tan_fov_y[i].item(),
+            tanfovx=tan_fov_values[i][0],
+            tanfovy=tan_fov_values[i][1],
             bg=background_color[i],
             scale_modifier=1.0,
             # viewmatrix=view_matrix[i],
@@ -123,8 +122,6 @@ def render_cuda(
 
         rasterizer = GaussianRasterizer(settings)
 
-        row, col = torch.triu_indices(3, 3)
-       
         image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
                 means3D = gaussian_means[i],
                 means2D = mean_gradients,
@@ -133,13 +130,11 @@ def render_cuda(
                 opacities = gaussian_opacities[i, ..., None],
                 scales = gaussian_scales[i],
                 rotations = gaussian_rotations[i],
-                # cov3Ds_precomp = gaussian_covariances[i, :, row, col],
                 viewmatrix = view_matrix[i]
             )
 
 
         all_images.append(image)
-        all_radii.append(radii)
         all_depths.append(rendered_depth)
     return torch.stack(all_images), torch.stack(all_depths)
 

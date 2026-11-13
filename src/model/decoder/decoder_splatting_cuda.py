@@ -57,7 +57,6 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             image_shape,
             repeat(self.background_color, "c -> (b v) c", b=b, v=v),
             repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
-            repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
             repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
             repeat(gaussians.rotations, "b g i -> (b v) g i", v=v),

@@ -48,7 +48,18 @@ class LossReproj(Loss[LossReprojCfg, LossReprojCfgWrapper]):
         self.repro_loss_hard_clamp = 1000
         self.soft_clamp = 50
         self.soft_clamp_min = 1
-    
+        self.register_buffer("_pixel_grid", torch.empty(0), persistent=False)
+        self._pixel_grid_shape = None
+
+    def _get_pixel_grid(self, height, width, *, device, dtype):
+        cache_key = (height, width, device, dtype)
+        if self._pixel_grid_shape != cache_key:
+            x = torch.arange(width, device=device, dtype=dtype)
+            y = torch.arange(height, device=device, dtype=dtype)
+            grid_x, grid_y = torch.meshgrid(x, y, indexing="xy")
+            self._pixel_grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+            self._pixel_grid_shape = cache_key
+        return self._pixel_grid
 
     def forward(self, pts3d, im_poses, intrinsics, global_step, detach_pts3d=False):
         '''
@@ -71,13 +82,12 @@ class LossReproj(Loss[LossReprojCfg, LossReprojCfgWrapper]):
         pred_px = rearrange(pred_px, "b (h w) c -> b h w c", h=height, w=width)
         
 
-        origin = [0,0]
-        tw, th = [torch.arange(o, o + s) for s, o in zip((width, height), origin)]
-        grid = torch.meshgrid(tw, th, indexing='xy')
-        pixel_grid_2HW = torch.stack(grid) # [2, h, w]
-        pixel_positions_12HW = pixel_grid_2HW[None]  # [1, 2, h, w]
-        target_pixel_positions_B2HW = pixel_positions_12HW.repeat(b, 1, 1, 1)  # [b, 2, h, w]
-        target_px = rearrange(target_pixel_positions_B2HW, "b c h w -> b h w c").to(device) # [b, h, w, 2]
+        target_px = self._get_pixel_grid(
+            height,
+            width,
+            device=device,
+            dtype=pred_px.dtype,
+        ).expand(b, -1, -1, -1)
 
         reprojection_error = pred_px - target_px # [b, h, w, 2]
         reprojection_error = torch.norm(reprojection_error, dim=-1, keepdim=True, p=2) # [b, h, w, 1]
@@ -88,17 +98,9 @@ class LossReproj(Loss[LossReprojCfg, LossReprojCfgWrapper]):
         valid_mask = ~invalid_mask
 
 
-        if valid_mask.sum() > 0:
-            # Reprojection error for all valid scene coordinates.
-            valid_reprojection_error = reprojection_error[valid_mask] # [valid_num]
-
-            # Compute the loss for valid predictions.
-            repro_loss_valid = self.compute(valid_reprojection_error, global_step)
-            repro_loss_valid = repro_loss_valid / valid_reprojection_error.shape[0]
-        else:
-            repro_loss_valid = 0
-
-        return repro_loss_valid
+        valid_reprojection_error = reprojection_error[valid_mask]
+        repro_loss_valid = self.compute(valid_reprojection_error, global_step)
+        return repro_loss_valid / max(valid_reprojection_error.shape[0], 1)
 
     def compute(self, repro_errs_b1N, iteration):
         """

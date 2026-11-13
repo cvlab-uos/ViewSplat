@@ -55,6 +55,12 @@ class EncoderSPF_ViewSplatCfg:
     vd_mlp_hidden_dim: int
     vd_mlp_in_dim: int
 
+    view_dependent_update_scale: bool = True
+    view_dependent_update_rotation: bool = True
+    view_dependent_update_color: bool = True
+    view_dependent_update_opacity: bool = True
+    view_dependent_update_mean: bool = True
+
     input_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     input_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
     pretrained_weights: str = ""
@@ -144,13 +150,36 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
             self.view_dependent_head2 = None
             return
 
-        # MLP structure definition: [Pose_In, Hidden, GS_Offset]
-        # # Assuming all parameters include gaussian centers(pts3d): mean, scale, rotation, color, opacity -> 86
-        self.vd_mlp_dims = [cfg.vd_mlp_in_dim, cfg.vd_mlp_hidden_dim, self.raw_gs_dim + 3]
+        # MLP structure definition: [Pose_In, Hidden, enabled GS offsets]
+        offset_dim = self.get_view_dependent_offset_dim(cfg)
+        if offset_dim == 0:
+            raise ValueError(
+                "At least one view-dependent update must be enabled when "
+                "use_view_dependent_head is true."
+            )
+        self.vd_mlp_dims = [
+            cfg.vd_mlp_in_dim,
+            cfg.vd_mlp_hidden_dim,
+            offset_dim,
+        ]
 
         self.view_dependent_head = head_factory('dpt', 'view_mlp', self.backbone, mlp_dims=self.vd_mlp_dims)
         self.view_dependent_head2 = head_factory('dpt', 'view_mlp', self.backbone, mlp_dims=self.vd_mlp_dims)
-   
+
+    def get_view_dependent_offset_dim(self, cfg: EncoderSPF_ViewSplatCfg) -> int:
+        offset_dim = 0
+        if cfg.view_dependent_update_mean:
+            offset_dim += 3
+        if cfg.view_dependent_update_opacity:
+            offset_dim += 1
+        if cfg.view_dependent_update_scale:
+            offset_dim += 3
+        if cfg.view_dependent_update_rotation:
+            offset_dim += 4
+        if cfg.view_dependent_update_color:
+            offset_dim += self.gaussian_adapter.d_in - 7
+        return offset_dim
+
     def set_pose_head(self, cfg, head_type='mlp'):
         self.pose_head = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
         self.pose_head2 = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
@@ -186,195 +215,287 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
         target: Optional[dict] = None,
-    ) :
-        device = context["image"].device
-        b, v_cxt, _, h, w = context["image"].shape
-
+        build_base_gaussians: bool = True,
+        visualization_keys: Optional[set[str]] = None,
+        defer_view_mlp_projection: bool = False,
+    ):
+        _, v_cxt, _, h, w = context["image"].shape
+        if visualization_dump is None:
+            requested_visualizations = set()
+        elif visualization_keys is None:
+            requested_visualizations = {
+                "depth", "scales", "rotations", "means", "opacities"
+            }
+        else:
+            requested_visualizations = set(visualization_keys)
 
         if target is not None:
             v_tgt = target["image"].shape[1]
             context_target = {
-                "image": normalize_image(torch.cat([context["image"], target["image"]], dim=1)),
-                "intrinsics": torch.cat([context["intrinsics"], target["intrinsics"]], dim=1),
+                "image": normalize_image(
+                    torch.cat([context["image"], target["image"]], dim=1)
+                ),
+                "intrinsics": torch.cat(
+                    [context["intrinsics"], target["intrinsics"]], dim=1
+                ),
             }
-            # Encode the context and target images.
             out = self.backbone(context_target, target_num_views=v_tgt)
-            dec_feat, dec_feat_w_tgt = out['dec_feat'], out['dec_feat_w_tgt']
+            dec_feat, dec_feat_w_tgt = out["dec_feat"], out["dec_feat_w_tgt"]
         else:
             v_tgt = 0
             context_input = {
                 "image": normalize_image(context["image"]),
                 "intrinsics": context["intrinsics"],
             }
-            # Encode the context images.
             out = self.backbone(context_input)
-            dec_feat = out['dec_feat']
+            dec_feat = out["dec_feat"]
 
         shape, images = out["shape"], out["images"]
-        
-        with torch.amp.autocast('cuda', enabled=False):
+
+        with torch.amp.autocast("cuda", enabled=False):
             all_mean_res, all_other_params = [], []
+            all_vd_params, all_vd_features = [], []
             if self.cfg.estimating_pose:
                 all_pose_params, all_pose_params_cwt = [], []
 
-            
-            # Pts3d head (context only)
-            res1 = self._downstream_head(1, [tok[:, 0].float() for tok in dec_feat], shape[:, 0])
-            all_mean_res.append(res1)
+            all_mean_res.append(
+                self._downstream_head(
+                    1,
+                    [tok[:, 0].float() for tok in dec_feat],
+                    shape[:, 0],
+                )
+            )
             for i in range(1, v_cxt):
-                res2 = self._downstream_head(2, [tok[:, i].float() for tok in dec_feat], shape[:, i])
-                all_mean_res.append(res2)
-            
-            # Gaussian parameter head (context only)
-            if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3], shape[0, 0].cpu().tolist())
-                GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
-                all_other_params.append(GS_res1)
-                for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3], shape[0, i].cpu().tolist())
-                    GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
-                    all_other_params.append(GS_res2)
-            else:
+                all_mean_res.append(
+                    self._downstream_head(
+                        2,
+                        [tok[:, i].float() for tok in dec_feat],
+                        shape[:, i],
+                    )
+                )
+
+            if "dpt" not in self.gs_params_head_type:
                 raise NotImplementedError(f"unexpected {self.gs_params_head_type=}")
-            
-            # View dependent head (context only)
-            all_vd_params = []
+            gs_res = self.gaussian_param_head(
+                [tok[:, 0].float() for tok in dec_feat],
+                images[:, 0, :3],
+                shape[0, 0].cpu().tolist(),
+            )
+            all_other_params.append(rearrange(gs_res, "b d h w -> b (h w) d"))
+            for i in range(1, v_cxt):
+                gs_res = self.gaussian_param_head2(
+                    [tok[:, i].float() for tok in dec_feat],
+                    images[:, i, :3],
+                    shape[0, i].cpu().tolist(),
+                )
+                all_other_params.append(
+                    rearrange(gs_res, "b d h w -> b (h w) d")
+                )
+
             if self.cfg.use_view_dependent_head:
-                vd_params1 = self.view_dependent_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3], shape[0, 0].cpu().tolist())
-                # vd_params1 shape: [B, total_params, H, W]
-                all_vd_params.append(rearrange(vd_params1, "b c h w -> b (h w) c"))
-                for i in range(1, v_cxt):
-                    vd_params2 = self.view_dependent_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3], shape[0, i].cpu().tolist())
-                    all_vd_params.append(rearrange(vd_params2, "b c h w -> b (h w) c"))
+                use_tiled_view_mlp = defer_view_mlp_projection
+                view_head = self.view_dependent_head
+                view_args = (
+                    [tok[:, 0].float() for tok in dec_feat],
+                    images[:, 0, :3],
+                    shape[0, 0].cpu().tolist(),
+                )
+                if use_tiled_view_mlp:
+                    all_vd_features.append(view_head.forward_features(*view_args))
+                else:
+                    view_params = view_head(*view_args)
+                    all_vd_params.append(
+                        rearrange(view_params, "b c h w -> b (h w) c")
+                    )
 
-            # Pose head
+                for i in range(1, v_cxt):
+                    view_head = self.view_dependent_head2
+                    view_args = (
+                        [tok[:, i].float() for tok in dec_feat],
+                        images[:, i, :3],
+                        shape[0, i].cpu().tolist(),
+                    )
+                    if use_tiled_view_mlp:
+                        all_vd_features.append(view_head.forward_features(*view_args))
+                    else:
+                        view_params = view_head(*view_args)
+                        all_vd_params.append(
+                            rearrange(view_params, "b c h w -> b (h w) c")
+                        )
+
             if self.cfg.estimating_pose:
-                # Context views
-                pose_res1 = self.pose_head([tok[:, 0].float() for tok in dec_feat], shape[0, 0].cpu().tolist()) # (16, 9)
-                all_pose_params.append(pose_res1)
+                all_pose_params.append(
+                    self.pose_head(
+                        [tok[:, 0].float() for tok in dec_feat],
+                        shape[0, 0].cpu().tolist(),
+                    )
+                )
                 for i in range(1, v_cxt):
-                    pose_res2 = self.pose_head2([tok[:, i].float() for tok in dec_feat], shape[0, i].cpu().tolist()) # (16, 9)
-                    all_pose_params.append(pose_res2)
+                    all_pose_params.append(
+                        self.pose_head2(
+                            [tok[:, i].float() for tok in dec_feat],
+                            shape[0, i].cpu().tolist(),
+                        )
+                    )
 
-                # Context + target views
                 if target is not None:
-                    pose_res1 = self.pose_head([tok[:, 0].float() for tok in dec_feat_w_tgt], shape[0, 0].cpu().tolist()) # (16, 9)
-                    all_pose_params_cwt.append(pose_res1)
+                    all_pose_params_cwt.append(
+                        self.pose_head(
+                            [tok[:, 0].float() for tok in dec_feat_w_tgt],
+                            shape[0, 0].cpu().tolist(),
+                        )
+                    )
                     for i in range(1, v_cxt + v_tgt):
-                        pose_res2 = self.pose_head2([tok[:, i].float() for tok in dec_feat_w_tgt], shape[0, i].cpu().tolist()) # (16, 9)
-                        all_pose_params_cwt.append(pose_res2)
-            
+                        all_pose_params_cwt.append(
+                            self.pose_head2(
+                                [tok[:, i].float() for tok in dec_feat_w_tgt],
+                                shape[0, i].cpu().tolist(),
+                            )
+                        )
 
-            
-            
-        gaussians = torch.stack(all_other_params, dim=1) # [b, v, 65536, 83]
-        
+        raw_gaussians = torch.stack(all_other_params, dim=1)
+
         if self.cfg.estimating_pose:
-            poses_enc = torch.stack(all_pose_params, dim=1) # (b, v 9)
-            pred_extrinsics = self.process_pose(poses_enc, v_cxt) # (b, v, 4, 4)
-
+            poses_enc = torch.stack(all_pose_params, dim=1)
+            pred_extrinsics = self.process_pose(poses_enc, v_cxt)
             if target is not None:
-                poses_enc_cwt = torch.stack(all_pose_params_cwt, dim=1) # (b, v + v2, 9)
-                pred_extrinsics_cwt = self.process_pose(poses_enc_cwt, v_cxt) # (b, v + v2, 4, 4)
+                poses_enc_cwt = torch.stack(all_pose_params_cwt, dim=1)
+                pred_extrinsics_cwt = self.process_pose(poses_enc_cwt, v_cxt)
 
-
-
-        pts_all = [all_mean_res_i['pts3d'] for all_mean_res_i in all_mean_res]
-        pts_all = torch.stack(pts_all, dim=1) # [b, v, h, w, 3]
+        pts_all = torch.stack(
+            [mean_result["pts3d"] for mean_result in all_mean_res],
+            dim=1,
+        )
         pts_all = rearrange(pts_all, "b v h w xyz -> b v (h w) xyz")
-        context_extrinsics = pred_extrinsics[:, :v_cxt] if self.cfg.estimating_pose else context["extrinsics"]
-        depths_per_view = self.process_depth(context_extrinsics, rearrange(pts_all, "b v (h w) xyz -> b v h w xyz", h=h, w=w)) # depth for each cam, (b, v, h, w)
-            
-
-        gaussians = rearrange(gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces) # for cfg.num_surfaces
-        raw_densities = gaussians[..., 0]
-        densities = gaussians[..., 0].sigmoid().unsqueeze(-1)
-        gaussian_parameters = gaussians[..., 1:]
-        pts_all = pts_all.unsqueeze(-2)  # for cfg.num_surfaces [B, V_cxt, N, S, 3]
-
-
-        # Convert the features and depths into Gaussians.
-        gaussians = self.gaussian_adapter.forward(
-            pts_all.unsqueeze(-2),
-            self.map_pdf_to_opacity(densities, global_step),
-            rearrange(gaussian_parameters, "b v r srf c -> b v r srf () c"),
+        context_extrinsics = (
+            pred_extrinsics[:, :v_cxt]
+            if self.cfg.estimating_pose
+            else context["extrinsics"]
         )
 
+        raw_gaussians = rearrange(
+            raw_gaussians,
+            "... (srf c) -> ... srf c",
+            srf=self.cfg.num_surfaces,
+        )
+        raw_densities = raw_gaussians[..., 0]
+        densities = raw_densities.sigmoid().unsqueeze(-1)
+        gaussian_parameters = raw_gaussians[..., 1:]
+        pts_all = pts_all.unsqueeze(-2)
 
-        # Dump visualizations if needed.
+        need_base_gaussians = build_base_gaussians or bool(
+            requested_visualizations & {"scales", "rotations", "opacities"}
+        )
+        base_gaussians = None
+        if need_base_gaussians:
+            base_gaussians = self.gaussian_adapter.forward(
+                pts_all.unsqueeze(-2),
+                self.map_pdf_to_opacity(densities, global_step),
+                rearrange(
+                    gaussian_parameters,
+                    "b v r srf c -> b v r srf () c",
+                ),
+            )
+
         if visualization_dump is not None:
-            visualization_dump["depth"] = depths_per_view
+            if "depth" in requested_visualizations:
+                visualization_dump["depth"] = self.process_depth(
+                    context_extrinsics,
+                    rearrange(
+                        pts_all.squeeze(-2),
+                        "b v (h w) xyz -> b v h w xyz",
+                        h=h,
+                        w=w,
+                    ),
+                )
+            if "means" in requested_visualizations:
+                visualization_dump["means"] = rearrange(
+                    pts_all,
+                    "b v (h w) srf xyz -> b v h w srf xyz",
+                    h=h,
+                    w=w,
+                )
+            if "scales" in requested_visualizations:
+                visualization_dump["scales"] = rearrange(
+                    base_gaussians.scales,
+                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                )
+            if "rotations" in requested_visualizations:
+                visualization_dump["rotations"] = rearrange(
+                    base_gaussians.rotations,
+                    "b v r srf spp xyzw -> b (v r srf spp) xyzw",
+                )
+            if "opacities" in requested_visualizations:
+                visualization_dump["opacities"] = rearrange(
+                    base_gaussians.opacities,
+                    "b v (h w) srf spp -> b v h w srf spp",
+                    h=h,
+                    w=w,
+                )
 
-            visualization_dump["scales"] = rearrange(
-                gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
-            )
-            visualization_dump["rotations"] = rearrange(
-                gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
-            )
-            visualization_dump["means"] = rearrange(
-                gaussians.means, "b v (h w) srf spp xyz -> b v h w (srf spp) xyz", h=h, w=w
-            ) 
-            visualization_dump['opacities'] = rearrange(
-                gaussians.opacities, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ) 
-
-            
+        mean_map = rearrange(
+            pts_all,
+            "b v (h w) srf xyz -> b v h w srf xyz",
+            h=h,
+            w=w,
+        ).squeeze(-2)
         if self.cfg.estimating_focal:
-            intrinsics = estimate_intrinsics(rearrange(gaussians.means, "b v (h w) srf spp xyz -> b v h w (srf spp) xyz", h=h, w=w).squeeze(-2), h, w)
+            intrinsics = estimate_intrinsics(mean_map, h, w)
             pred_intrinsics = intrinsics.unsqueeze(1).repeat(1, v_cxt, 1, 1)
-            pred_intrinsics_cwt = intrinsics.unsqueeze(1).repeat(1, v_cxt+v_tgt, 1, 1)
-
-
-        encoder_output = dict()
-
-
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.covariances,
-                "b v r srf spp i j -> b (v r srf spp) i j",
-            ),
-            rearrange(
-                gaussians.rotations,
-                "b v r srf spp i  -> b (v r srf spp) i ",
-            ),
-            rearrange(
-                gaussians.scales,
-                "b v r srf spp i  -> b (v r srf spp) i ",
-            ),
-            rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-            ),
-            rearrange(
-                gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
+            pred_intrinsics_cwt = intrinsics.unsqueeze(1).repeat(
+                1, v_cxt + v_tgt, 1, 1
             )
-        )
+
+        encoder_output = {}
+        if build_base_gaussians:
+            encoder_output["gaussians"] = Gaussians(
+                rearrange(
+                    base_gaussians.means,
+                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                ),
+                rearrange(
+                    base_gaussians.covariances,
+                    "b v r srf spp i j -> b (v r srf spp) i j",
+                ),
+                rearrange(
+                    base_gaussians.rotations,
+                    "b v r srf spp i -> b (v r srf spp) i",
+                ),
+                rearrange(
+                    base_gaussians.scales,
+                    "b v r srf spp i -> b (v r srf spp) i",
+                ),
+                rearrange(
+                    base_gaussians.harmonics,
+                    "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
+                ),
+                rearrange(
+                    base_gaussians.opacities,
+                    "b v r srf spp -> b (v r srf spp)",
+                ),
+            )
 
         if self.cfg.use_view_dependent_head:
-            encoder_output["vd_mlp_params"] = torch.stack(all_vd_params, dim=1) # [B, V_cxt, N, total_params]
+            if defer_view_mlp_projection:
+                encoder_output["vd_mlp_features"] = all_vd_features
+            else:
+                encoder_output["vd_mlp_params"] = torch.stack(all_vd_params, dim=1)
             encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
-
-            # Raw data for refinement (Base value before add offsets)
             encoder_output["raw_data"] = {
                 "pts3d": pts_all,
                 "opacities": raw_densities,
-                "params": gaussian_parameters
+                "params": gaussian_parameters,
             }
 
         if self.cfg.estimating_pose:
-            encoder_output['extrinsics'] = {"c": pred_extrinsics}
+            encoder_output["extrinsics"] = {"c": pred_extrinsics}
             if target is not None:
-                encoder_output['extrinsics']['cwt'] = pred_extrinsics_cwt
+                encoder_output["extrinsics"]["cwt"] = pred_extrinsics_cwt
 
         if self.cfg.estimating_focal:
-            encoder_output['intrinsics'] = {"c": pred_intrinsics}
+            encoder_output["intrinsics"] = {"c": pred_intrinsics}
             if target is not None:
-                encoder_output['intrinsics']['cwt'] = pred_intrinsics_cwt
+                encoder_output["intrinsics"]["cwt"] = pred_intrinsics_cwt
 
         return encoder_output
 
@@ -440,6 +561,25 @@ class EncoderSPF_ViewSplat(Encoder[EncoderSPF_ViewSplatCfg]):
         pose_input = torch.cat([dir_vec, log_dist], dim=-1) # (b, 1, n, 4)
 
         return pose_input
+
+    def compute_view_dependent_offset_from_features(self, features, input, dims):
+        offsets = []
+        for view_index, (view_features, view_input) in enumerate(
+            zip(features, input.unbind(dim=1))
+        ):
+            head = (
+                self.view_dependent_head
+                if view_index == 0
+                else self.view_dependent_head2
+            )
+            offsets.append(
+                head.compute_offset_from_features(
+                    view_features,
+                    view_input,
+                    checkpoint_tiles=self.training,
+                )
+            )
+        return torch.stack(offsets, dim=1)
 
     def compute_view_dependent_offset(self, params, input, dims):
         return DPTViewHead.compute_offset(params, input, dims)

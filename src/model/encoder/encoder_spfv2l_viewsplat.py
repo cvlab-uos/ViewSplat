@@ -148,136 +148,198 @@ class EncoderSPFV2L_ViewSplat(Encoder[EncoderSPFV2L_ViewSplatCfg]):
         global_step: int = 0,
         visualization_dump: Optional[dict] = None,
         target: Optional[dict] = None,
-    ) :
-        device = context["image"].device
-        b, v_cxt, _, h, w = context["image"].shape
-
+        build_base_gaussians: bool = True,
+        visualization_keys: Optional[set[str]] = None,
+        defer_view_mlp_projection: bool = False,
+    ):
+        _, v_cxt, _, h, w = context["image"].shape
+        if visualization_dump is None:
+            requested_visualizations = set()
+        elif visualization_keys is None:
+            requested_visualizations = {
+                "depth", "scales", "rotations", "means", "opacities"
+            }
+        else:
+            requested_visualizations = set(visualization_keys)
 
         if target is not None:
             v_tgt = target["image"].shape[1]
             context_target = {
                 "image": torch.cat([context["image"], target["image"]], dim=1),
-                "intrinsics": torch.cat([context["intrinsics"], target["intrinsics"]], dim=1)
+                "intrinsics": torch.cat(
+                    [context["intrinsics"], target["intrinsics"]], dim=1
+                ),
             }
-            # Encode the context and target images.
-            aggregated_tokens_list, ps_idx = self.backbone(context_target, target_num_views=v_tgt)
+            aggregated_tokens_list, ps_idx = self.backbone(
+                context_target,
+                target_num_views=v_tgt,
+            )
         else:
             v_tgt = 0
-            aggregated_tokens_list, ps_idx = self.backbone(context, target_num_views=0)
-            
+            aggregated_tokens_list, ps_idx = self.backbone(
+                context,
+                target_num_views=0,
+            )
+
         if self.cfg.estimating_pose:
-            camera_enc = self.backbone.model.camera_head(aggregated_tokens_list)[-1] # [b, v, 9]
-            extri, _ = pose_encoding_to_extri_intri(camera_enc, context["image"].shape[-2:])
-            if self.cfg.estimating_pose:
-                pred_extrinsics = self.process_pose(extri, v_cxt)
-               
+            camera_enc = self.backbone.model.camera_head(
+                aggregated_tokens_list
+            )[-1]
+            extrinsics_enc, _ = pose_encoding_to_extri_intri(
+                camera_enc,
+                context["image"].shape[-2:],
+            )
+            pred_extrinsics = self.process_pose(extrinsics_enc, v_cxt)
 
-        context_aggregated_tokens_list = []
-        for aggregated_tokens in aggregated_tokens_list:
-            context_aggregated_tokens_list.append(aggregated_tokens[:,:v_cxt].contiguous())
+        context_tokens = [
+            tokens[:, :v_cxt].contiguous()
+            for tokens in aggregated_tokens_list
+        ]
 
-        # Predict Point Maps
-        point_map, _ = self.backbone.model.point_head(context_aggregated_tokens_list, context["image"], ps_idx) # [b, v, h, w, 3]
-        # print("point_map", point_map.shape)
+        point_map, _ = self.backbone.model.point_head(
+            context_tokens,
+            context["image"],
+            ps_idx,
+        )
         pts_all = rearrange(point_map, "b v h w xyz -> b v (h w) xyz")
-        extrinsics = pred_extrinsics[:, :v_cxt] if self.cfg.estimating_pose else context["extrinsics"]
-        depths_per_view = self.process_depth(extrinsics, rearrange(pts_all, "b v (h w) xyz -> b v h w xyz", h=h, w=w)) # depth for each cam, (b, v, h, w)
-
-        
-
-        # Predict gaussians 
-        gs_map = self.gaussian_param_head(context_aggregated_tokens_list, context["image"], ps_idx) # [b, v, h, w, 83]
-        gaussians = rearrange(gs_map, "b v h w c -> b v (h w) c") 
-        gaussians = rearrange(gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces) # for cfg.num_surfaces
-        raw_densities = gaussians[..., 0]
-        densities = gaussians[..., 0].sigmoid().unsqueeze(-1) 
-        gaussian_parameters = gaussians[..., 1:]
-        pts_all = pts_all.unsqueeze(-2)  # for cfg.num_surfaces [B, V_cxt, N, S, 3]
-
-        # Predict View Dependent Params (Optional)
-        all_vd_params = []
-        if self.cfg.use_view_dependent_head:
-            # DPTViewHead Forward
-            # Output: [B, V, total_params, H, W]
-            vd_map = self.view_dependent_head(context_aggregated_tokens_list, context["image"], ps_idx)
-            
-            # Rearrange to [B, V, N, total_params]
-            all_vd_params = rearrange(vd_map, "b v c h w -> b v (h w) c")
-
-        # Convert the features and depths into Gaussians.
-        gaussians = self.gaussian_adapter.forward(
-            pts_all.unsqueeze(-2),
-            self.map_pdf_to_opacity(densities, global_step),
-            rearrange(gaussian_parameters, "b v r srf c -> b v r srf () c"),
+        context_extrinsics = (
+            pred_extrinsics[:, :v_cxt]
+            if self.cfg.estimating_pose
+            else context["extrinsics"]
         )
-            
-        
-        # Dump visualizations if needed.
+
+        gs_map = self.gaussian_param_head(
+            context_tokens,
+            context["image"],
+            ps_idx,
+        )
+        raw_gaussians = rearrange(gs_map, "b v h w c -> b v (h w) c")
+        raw_gaussians = rearrange(
+            raw_gaussians,
+            "... (srf c) -> ... srf c",
+            srf=self.cfg.num_surfaces,
+        )
+        raw_densities = raw_gaussians[..., 0]
+        densities = raw_densities.sigmoid().unsqueeze(-1)
+        gaussian_parameters = raw_gaussians[..., 1:]
+        pts_all = pts_all.unsqueeze(-2)
+
+        if self.cfg.use_view_dependent_head:
+            if defer_view_mlp_projection:
+                vd_features = self.view_dependent_head.forward_features(
+                    context_tokens,
+                    context["image"],
+                    ps_idx,
+                )
+            else:
+                vd_map = self.view_dependent_head(
+                    context_tokens,
+                    context["image"],
+                    ps_idx,
+                )
+                vd_params = rearrange(
+                    vd_map,
+                    "b v c h w -> b v (h w) c",
+                )
+
+        need_base_gaussians = build_base_gaussians or bool(
+            requested_visualizations & {"scales", "rotations", "opacities"}
+        )
+        base_gaussians = None
+        if need_base_gaussians:
+            base_gaussians = self.gaussian_adapter.forward(
+                pts_all.unsqueeze(-2),
+                self.map_pdf_to_opacity(densities, global_step),
+                rearrange(
+                    gaussian_parameters,
+                    "b v r srf c -> b v r srf () c",
+                ),
+            )
+
         if visualization_dump is not None:
-            visualization_dump["depth"] = depths_per_view
+            if "depth" in requested_visualizations:
+                visualization_dump["depth"] = self.process_depth(
+                    context_extrinsics,
+                    rearrange(
+                        pts_all.squeeze(-2),
+                        "b v (h w) xyz -> b v h w xyz",
+                        h=h,
+                        w=w,
+                    ),
+                )
+            if "means" in requested_visualizations:
+                visualization_dump["means"] = rearrange(
+                    pts_all,
+                    "b v (h w) srf xyz -> b v h w srf xyz",
+                    h=h,
+                    w=w,
+                )
+            if "scales" in requested_visualizations:
+                visualization_dump["scales"] = rearrange(
+                    base_gaussians.scales,
+                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                )
+            if "rotations" in requested_visualizations:
+                visualization_dump["rotations"] = rearrange(
+                    base_gaussians.rotations,
+                    "b v r srf spp xyzw -> b (v r srf spp) xyzw",
+                )
+            if "opacities" in requested_visualizations:
+                visualization_dump["opacities"] = rearrange(
+                    base_gaussians.opacities,
+                    "b v (h w) srf spp -> b v h w srf spp",
+                    h=h,
+                    w=w,
+                )
 
-            visualization_dump["scales"] = rearrange(
-                gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
+        encoder_output = {}
+        if build_base_gaussians:
+            encoder_output["gaussians"] = Gaussians(
+                rearrange(
+                    base_gaussians.means,
+                    "b v r srf spp xyz -> b (v r srf spp) xyz",
+                ),
+                rearrange(
+                    base_gaussians.covariances,
+                    "b v r srf spp i j -> b (v r srf spp) i j",
+                ),
+                rearrange(
+                    base_gaussians.rotations,
+                    "b v r srf spp i -> b (v r srf spp) i",
+                ),
+                rearrange(
+                    base_gaussians.scales,
+                    "b v r srf spp i -> b (v r srf spp) i",
+                ),
+                rearrange(
+                    base_gaussians.harmonics,
+                    "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
+                ),
+                rearrange(
+                    base_gaussians.opacities,
+                    "b v r srf spp -> b (v r srf spp)",
+                ),
             )
-            visualization_dump["rotations"] = rearrange(
-                gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"
-            )
-            visualization_dump["means"] = rearrange(
-                gaussians.means, "b v (h w) srf spp xyz -> b v h w (srf spp) xyz", h=h, w=w
-            ) # (b, v, h, w, 1, 3)
-            visualization_dump['opacities'] = rearrange(
-                gaussians.opacities, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ) # (b, v, h, w, 1, 1)
-
-           
-
-        encoder_output = dict()
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.covariances,
-                "b v r srf spp i j -> b (v r srf spp) i j",
-            ),
-            rearrange(
-                gaussians.rotations,
-                "b v r srf spp i  -> b (v r srf spp) i ",
-            ),
-            rearrange(
-                gaussians.scales,
-                "b v r srf spp i  -> b (v r srf spp) i ",
-            ),
-            rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-            ),
-            rearrange(
-                gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
-            )
-        )
 
         if self.cfg.use_view_dependent_head:
-            encoder_output["vd_mlp_params"] = all_vd_params
+            if defer_view_mlp_projection:
+                encoder_output["vd_mlp_features"] = vd_features
+            else:
+                encoder_output["vd_mlp_params"] = vd_params
             encoder_output["vd_mlp_dims"] = self.vd_mlp_dims
-
-            # Raw data for refinement (Base value before add offsets)
             encoder_output["raw_data"] = {
-                "pts3d": pts_all, # [B, V, N, S, 3]
-                "opacities": raw_densities,  # [B, V, N, S]
-                "params": gaussian_parameters # [B, V, N, S, C]
+                "pts3d": pts_all,
+                "opacities": raw_densities,
+                "params": gaussian_parameters,
             }
 
         if self.cfg.estimating_pose:
-            encoder_output['extrinsics'] = dict()
-            encoder_output['extrinsics']['c'] = pred_extrinsics[:,:v_cxt]
+            encoder_output["extrinsics"] = {
+                "c": pred_extrinsics[:, :v_cxt],
+            }
             if target is not None:
-                encoder_output['extrinsics']['cwt'] = pred_extrinsics
+                encoder_output["extrinsics"]["cwt"] = pred_extrinsics
 
-
-        
         return encoder_output
 
     def process_pose(self, poses, context_views):
@@ -344,6 +406,21 @@ class EncoderSPFV2L_ViewSplat(Encoder[EncoderSPFV2L_ViewSplatCfg]):
         pose_input = torch.cat([dir_vec, log_dist], dim=-1) # (b, 1, n, 4)
 
         return pose_input
+
+    def compute_view_dependent_offset_from_features(self, features, input, dims):
+        offsets = []
+        for view_features, view_input in zip(
+            features.unbind(dim=1),
+            input.unbind(dim=1),
+        ):
+            offsets.append(
+                self.view_dependent_head.compute_offset_from_features(
+                    view_features,
+                    view_input,
+                    checkpoint_tiles=self.training,
+                )
+            )
+        return torch.stack(offsets, dim=1)
 
     def compute_view_dependent_offset(self, params, input, dims):
         return DPTViewHead.compute_offset(params, input, dims)

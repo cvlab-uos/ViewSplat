@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from typing import List
 from .utils import create_uv_grid, position_grid_to_embed
 from .dpt_utils import _make_scratch, _make_fusion_block, custom_interpolate
+from ....heads.view_mlp import compute_view_mlp_offset, compute_view_mlp_offset_tiled
 
 
 class DPTViewHead(nn.Module):
@@ -118,6 +118,37 @@ class DPTViewHead(nn.Module):
 
         return torch.cat(all_preds, dim=1)
 
+    def forward_features(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        images: torch.Tensor,
+        patch_start_idx: int,
+        frames_chunk_size: int = 8,
+    ) -> torch.Tensor:
+        _, num_frames = images.shape[:2]
+        if frames_chunk_size is None or frames_chunk_size >= num_frames:
+            return self._forward_impl(
+                aggregated_tokens_list,
+                images,
+                patch_start_idx,
+                return_features=True,
+            )
+
+        all_features = []
+        for frames_start_idx in range(0, num_frames, frames_chunk_size):
+            frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
+            all_features.append(
+                self._forward_impl(
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx,
+                    frames_end_idx,
+                    return_features=True,
+                )
+            )
+        return torch.cat(all_features, dim=1)
+
     def _forward_impl(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -125,6 +156,7 @@ class DPTViewHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        return_features: bool = False,
     ) -> torch.Tensor:
         
         if frames_start_idx is not None and frames_end_idx is not None:
@@ -166,8 +198,11 @@ class DPTViewHead(nn.Module):
         if self.pos_embed:
             out = self._apply_pos_embed(out, W, H)
 
-        # Pass through final conv layers to get MLP parameters.
-        out = self.scratch.output_conv2(out)
+        # Keep the compact activation during training. The final 1x1 projection
+        # is evaluated tile-by-tile together with the dynamic MLP.
+        out = self.scratch.output_conv2[:-1](out)
+        if not return_features:
+            out = self.scratch.output_conv2[-1](out)
         
         # [B*S, C, H, W] -> [B, S, C, H, W]
         out = out.view(B, S, *out.shape[1:])
@@ -203,31 +238,21 @@ class DPTViewHead(nn.Module):
 
     @staticmethod
     def compute_offset(view_mlp_params, pose_input, mlp_dims):
-        B, V_cxt, C, H, W = view_mlp_params.shape
-        in_d, hi_d, ou_d = mlp_dims
+        return compute_view_mlp_offset(view_mlp_params, pose_input, mlp_dims)
 
-        # Rearrange for computation
-        flat_params = rearrange(view_mlp_params, "b v c h w -> (b v h w) c")
-
-        # Compute HyperNetwork
-        x_in = rearrange(pose_input, "b v n d -> (b v n) d 1")
-
-        idx = 0
-        # Layer 1
-        w1 = flat_params[:, idx:idx + in_d * hi_d].view(-1, hi_d, in_d)
-        idx += in_d * hi_d
-        b1 = flat_params[:, idx:idx + hi_d].view(-1, hi_d, 1)
-        idx += hi_d
-        
-        hidden = torch.bmm(w1, x_in) + b1
-        hidden = F.relu(hidden)
-        
-        # Layer 2
-        w2 = flat_params[:, idx:idx + hi_d * ou_d].view(-1, ou_d, hi_d)
-        idx += hi_d * ou_d
-        b2 = flat_params[:, idx:idx + ou_d].view(-1, ou_d, 1)
-        
-        offset = torch.bmm(w2, hidden) + b2
-        
-        # Return Gaussian parameter offsets
-        return rearrange(offset.squeeze(-1), "(b v n) d -> b v n d", b=B, v=V_cxt, n=H*W)
+    def compute_offset_from_features(
+        self,
+        features,
+        pose_input,
+        *,
+        tile_rows=16,
+        checkpoint_tiles=True,
+    ):
+        return compute_view_mlp_offset_tiled(
+            features,
+            pose_input,
+            self.scratch.output_conv2[-1],
+            self.mlp_dims,
+            tile_rows=tile_rows,
+            checkpoint_tiles=checkpoint_tiles,
+        )

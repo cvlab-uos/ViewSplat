@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from .dpt_gs_head import DPTOutputAdapter_fix, PixelwiseTaskWithDPT
 from .postprocess import postprocess
+from .view_mlp import compute_view_mlp_offset, compute_view_mlp_offset_tiled
 
 class DPTViewHead(PixelwiseTaskWithDPT):
     def __init__(self, mlp_dims, **kwargs):
@@ -39,41 +39,34 @@ class DPTViewHead(PixelwiseTaskWithDPT):
         view_mlp_params = self.dpt(x, imgs, image_size=(img_info[0], img_info[1]))
         return view_mlp_params
 
+    def forward_features(self, x, imgs, img_info):
+        return self.dpt.forward_view_features(
+            x,
+            imgs,
+            image_size=(img_info[0], img_info[1]),
+        )
+
     @staticmethod
     def compute_offset(view_mlp_params, pose_input, mlp_dims):
-        """
-        A function that computes offsets using the target pose within the decoder.
-            view_mlp_params: [B, V_cxt, total_params, H, W]
-            pose_input: [B, V_cxt, N, in_dim] (N = H*W) <- relative pose of each context view with regard to one target view
-        """
-        B, V_cxt, C, H, W = view_mlp_params.shape
-        in_d, hi_d, ou_d = mlp_dims
+        return compute_view_mlp_offset(view_mlp_params, pose_input, mlp_dims)
 
-        # Rearrange for computation
-        flat_params = rearrange(view_mlp_params, "b v c h w -> (b v h w) c") # [(B * V_cxt * N), C]
+    def compute_offset_from_features(
+        self,
+        features,
+        pose_input,
+        *,
+        tile_rows=16,
+        checkpoint_tiles=True,
+    ):
+        return compute_view_mlp_offset_tiled(
+            features,
+            pose_input,
+            self.dpt.head[-1],
+            self.mlp_dims,
+            tile_rows=tile_rows,
+            checkpoint_tiles=checkpoint_tiles,
+        )
 
-        # Compute HyperNetwork
-        x_in = rearrange(pose_input, "b v n d -> (b v n) d 1") # [(B * V_cxt * N), in_d, 1]
-
-        idx = 0
-        # Layer 1
-        w1 = flat_params[:, idx:idx + in_d * hi_d].view(-1, hi_d, in_d)
-        idx += in_d * hi_d
-        b1 = flat_params[:, idx:idx + hi_d].view(-1, hi_d, 1)
-        idx += hi_d
-        
-        hidden = torch.bmm(w1, x_in) + b1
-        hidden = F.relu(hidden)
-        
-        # Layer 2
-        w2 = flat_params[:, idx:idx + hi_d * ou_d].view(-1, ou_d, hi_d)
-        idx += hi_d * ou_d
-        b2 = flat_params[:, idx:idx + ou_d].view(-1, ou_d, 1)
-        
-        offset = torch.bmm(w2, hidden) + b2 # [(B*N), ou_d, 1]
-        
-        # Return Gaussian parameter offsets
-        return rearrange(offset.squeeze(-1), "(b v n) d -> b v n d", b=B, v=V_cxt, n=H*W)
 
 
 def create_view_dpt_head(net, mlp_dims, postprocess_func=postprocess):

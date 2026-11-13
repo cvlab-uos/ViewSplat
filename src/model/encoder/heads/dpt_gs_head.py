@@ -38,7 +38,7 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
             nn.ReLU(),
         )
 
-    def forward(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None, conf=None):
+    def _forward_features(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None):
         assert self.dim_tokens_enc is not None, 'Need to call init(dim_tokens_enc) function first'
         # H, W = input_info['image_size']
         image_size = self.image_size if image_size is None else image_size
@@ -72,10 +72,19 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_1 = self.feat_up(path_1)
         path_1 = path_1 + direct_img_feat
 
-        # Output head
-        out = self.head(path_1)
+        return path_1
 
+    def forward(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None, conf=None):
+        path_1 = self._forward_features(encoder_tokens, imgs, image_size)
+        out = self.head(path_1)
         return out
+
+    def forward_view_features(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None):
+        """Return activations immediately before the large view-MLP projection."""
+        if self.head_type != 'view_mlp':
+            raise RuntimeError('forward_view_features is only valid for view_mlp heads')
+        path_1 = self._forward_features(encoder_tokens, imgs, image_size)
+        return self.head[:-1](path_1)
 
 
 class PixelwiseTaskWithDPT(nn.Module):

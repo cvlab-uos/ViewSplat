@@ -101,29 +101,33 @@ def compute_pose_error(pose_gt, pose_pred):
 
 @torch.no_grad()
 def compute_pose_error_for_batch(pred_pose, tgt_pose):
-    # for relative estimated pose
-    '''
-        pred_pose : [b, v, 4, 4] or [b, 4, 4] or [4, 4]
-        tgt_pose: [b, v, 4, 4] or [b, 4, 4] or [4, 4]
-    '''
-
-    rel_angular_error = 0
-    rel_transl_error = 0
-
+    """Compute mean rotation/translation-direction errors without CPU loops."""
     if pred_pose.ndimension() == 4:
         pred_pose = rearrange(pred_pose, "b v ... -> (b v) ...")
         tgt_pose = rearrange(tgt_pose, "b v ... -> (b v) ...")
-    if pred_pose.ndimension() == 2:
+    elif pred_pose.ndimension() == 2:
         pred_pose = pred_pose.unsqueeze(0)
         tgt_pose = tgt_pose.unsqueeze(0)
 
-    cnt = pred_pose.shape[0]
+    pred_translation = pred_pose[:, :3, 3]
+    tgt_translation = tgt_pose[:, :3, 3]
+    translation_cosine = (pred_translation * tgt_translation).sum(dim=-1) / (
+        pred_translation.norm(dim=-1) * tgt_translation.norm(dim=-1) + 1e-9
+    )
+    translation_error = torch.rad2deg(
+        torch.acos(translation_cosine.clamp(-1.0, 1.0))
+    )
+    translation_error = torch.minimum(
+        translation_error,
+        180 - translation_error,
+    )
 
-    for i in range(cnt):
-        estimated_transl_error, _, estimated_angular_error = compute_pose_error(tgt_pose[i].cpu(), pred_pose[i].cpu()) # 
-        rel_angular_error += estimated_angular_error
-        rel_transl_error += estimated_transl_error
-
-    rel_angular_error = rel_angular_error / cnt
-    rel_transl_error = rel_transl_error /  cnt
-    return rel_angular_error, rel_transl_error
+    pred_rotation = pred_pose[:, :3, :3]
+    tgt_rotation = tgt_pose[:, :3, :3]
+    rotation_cosine = (
+        (pred_rotation * tgt_rotation).sum(dim=(-2, -1)) - 1
+    ) / 2
+    rotation_error = torch.rad2deg(
+        torch.abs(torch.acos(rotation_cosine.clamp(-1.0, 1.0)))
+    )
+    return rotation_error.mean(), translation_error.mean()
